@@ -1,0 +1,350 @@
+---
+title: "Data Downscaling"
+author: "Nidhi Ram"
+date: "2025-06-09"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(tidyverse)
+library(sf) 
+library(ggplot2) 
+library(leaflet) 
+library(dplyr) 
+library(tigris) 
+library(tidyr)
+library(gt)
+library(zipcodeR)
+library(maps)
+library(tidycensus)
+library(terra)
+library(exactextractr)
+library(raster)
+```
+
+# Make Grid
+```{r}
+us_counties <- st_transform(us_counties, crs = "EPSG:5070")
+us_counties_vect <- vect(us_counties)
+us_ext <- ext(us_counties_vect)
+grid <- rast(us_ext, resolution = 10000, crs = "EPSG:5070")
+grid_vect <- as.polygons(grid)
+grid_vect <- mask(grid_vect, us_counties_vect)
+
+plot(grid_vect, border = "grey")
+plot(us_counties_vect, add = TRUE, border = "black")
+
+```
+
+
+# Land Cover Data (NLCD) 
+```{r}
+grid_sf <- st_as_sf(grid_vect)
+lc_summary_grid <- exact_extract(land_cover, grid_sf, 'frac', progress=TRUE)
+
+lc_summary_grid <- lc_summary_grid %>%
+  rename(pasture_frac = frac_81, crops_frac = frac_82)
+
+lc_summary_grid <- lc_summary_grid %>%
+  rename(open_water=frac_11, perennial_ice_snow = frac_12, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+
+lc_summary_grid$farmland <- lc_summary_grid$pasture_frac + lc_summary_grid$crops_frac
+
+```
+
+# Plot farmland on grid
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+lc_grid_farmland <- lc_summary_grid$farmland
+grid_sf$farmland <- lc_grid_farmland
+
+ggplot(grid_sf) +
+  geom_sf(aes(fill = farmland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Farmland") +
+  theme_minimal() +
+  coord_sf()
+
+```
+
+# Let's try downscaling...
+
+## livestock units - just a test run
+```{r}
+us_counties <- st_transform(us_counties, st_crs(grid_sf))
+
+
+predictors <- us_counties %>%
+  left_join(livestock_units, by = c("GEOID" = "FIPS"))
+
+grid_sf <- st_join(grid_sf, predictors[, c("GEOID", "total_livestock_units")], left = FALSE) # county total livestock units
+
+grid_sf <- grid_sf %>%
+  group_by(GEOID) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate grid-level predictor: redistributed livestock units
+grid_sf <- grid_sf %>%
+  mutate(livestock_units_grid = total_livestock_units * (farmland / total_ag_frac))
+
+```
+
+## plot livestock units by grid cell
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(grid_sf) +
+  geom_sf(aes(fill = livestock_units_grid), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Livestock Units") +
+  theme_minimal() +
+  labs(title = "Redistributed Livestock Units per Grid Cell") +
+  coord_sf()
+
+```
+
+# Contiguous US Grid
+```{r}
+contiguous_states <- c(
+  "01", "04", "05", "06", "08", "09", "10", "11", "12", "13", "16", "17", 
+  "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", 
+  "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "44", 
+  "45", "46", "47", "48", "49", "50", "51", "53", "54", "55", "56")
+
+us_counties_contiguous <- us_counties %>%
+  filter(STATEFP %in% contiguous_states)
+us_counties_contiguous <- us_counties_contiguous %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+us_counties_contiguous <- st_transform(us_counties_contiguous, crs = "EPSG:5070")
+us_counties_cont_vect <- vect(us_counties_contiguous)
+us_cont_ext <- ext(us_counties_cont_vect)
+cont_grid <- rast(us_cont_ext, resolution = 10000, crs = "EPSG:5070")
+
+cont_grid_vect <- as.polygons(cont_grid)
+
+cont_grid_vect <- mask(cont_grid_vect, us_counties_cont_vect)
+
+plot(cont_grid_vect, border = "gray")
+plot(us_counties_cont_vect, add = TRUE, border = "black")
+
+
+```
+
+## land cover contiguous
+```{r}
+land_cover2 <- rast("Annual_NLCD_LndCov_2023_CU_C1V0.tif")
+plot(land_cover2)
+
+cont_grid_sf <- st_as_sf(cont_grid_vect)
+lc_summary_cont_grid <- exact_extract(land_cover2, cont_grid_sf, 'frac', progress=TRUE)
+
+lc_summary_cont_grid <- lc_summary_cont_grid %>%
+  rename(pasture_frac = frac_81, crops_frac = frac_82)
+lc_summary_cont_grid <- lc_summary_cont_grid %>%
+  rename(open_water=frac_11, perennial_ice_snow = frac_12, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+
+lc_summary_cont_grid$farmland <- lc_summary_cont_grid$pasture_frac + lc_summary_cont_grid$crops_frac
+
+
+```
+
+## plot farmland continguous US
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+lc_cont_grid_farmland <- lc_summary_cont_grid$farmland
+cont_grid_sf$farmland <- lc_cont_grid_farmland
+
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = farmland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Farmland") +
+  theme_minimal() +
+  coord_sf()
+
+
+```
+
+## plot farmland alaska
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+lc_cont_grid_farmland <- lc_summary_cont_grid$farmland
+cont_grid_sf$farmland <- lc_cont_grid_farmland
+
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = farmland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Farmland") +
+  theme_minimal() +
+  coord_sf()
+
+
+```
+
+
+## plot farmland continguous US
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+lc_cont_grid_farmland <- lc_summary_cont_grid$farmland
+cont_grid_sf$farmland <- lc_cont_grid_farmland
+
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = farmland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Farmland") +
+  theme_minimal() +
+  coord_sf()
+
+
+```
+
+## contiguous US livestock units
+```{r}
+us_counties_contiguous <- st_transform(us_counties_contiguous, st_crs(cont_grid_sf))
+
+cont_predictors <- us_counties_contiguous %>%
+  left_join(livestock_units, by = c("GEOID" = "FIPS"))
+
+cont_grid_sf <- st_join(cont_grid_sf, cont_predictors[, c("GEOID", "total_livestock_units")], left = FALSE) # county total livestock units
+
+cont_grid_sf <- cont_grid_sf %>%
+  group_by(GEOID) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate grid-level predictor: redistributed livestock units
+cont_grid_sf <- cont_grid_sf %>%
+  mutate(livestock_units_cont_grid = total_livestock_units * (farmland / total_ag_frac))
+
+```
+
+## plot livestock units by grid cell
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = livestock_units_cont_grid), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Livestock Units") +
+  theme_minimal() +
+  labs(title = "Redistributed Livestock Units per Grid Cell") +
+  coord_sf()
+
+```
+
+## contiguous livestock sales
+```{r}
+cont_predictors <- us_counties_contiguous %>%
+  left_join(ag_livestock_sales, by = c("GEOID" = "FIPS"))
+
+cont_grid_sf <- st_join(cont_grid_sf, cont_predictors[, c("GEOID", "livestock_sales")], left = FALSE) # county total livestock units
+
+cont_grid_sf <- cont_grid_sf %>%
+  group_by(GEOID.x) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+cont_grid_sf <- cont_grid_sf %>%
+  mutate(livestock_sales_cont_grid = livestock_sales * (farmland / total_ag_frac))
+
+
+```
+
+## plot livestock sales by grid cell
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = livestock_sales_cont_grid), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Livestock Sales Percentage") +
+  theme_minimal() +
+  labs(title = "Redistributed Livestock Sale Percentage per Grid Cell") +
+  coord_sf()
+
+```
+# Alaska grid
+```{r}
+# just Alaska
+alaska <- us_counties %>%
+  filter(STATEFP == "02")
+
+alaska <- alaska %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+alaska <- st_transform(alaska, crs = "EPSG:5070")
+alaska_vect <- vect(alaska)
+alaska_ext <- ext(alaska_vect)
+alaska_grid <- rast(alaska_ext, resolution = 10000, crs = "EPSG:5070")
+
+alaska_grid_vect <- as.polygons(alaska_grid)
+
+alaska_grid_vect <- mask(alaska_grid_vect, alaska_vect)
+
+plot(alaska_grid_vect, border = "gray")
+plot(alaska_vect, add = TRUE, border = "black")
+
+
+
+```
+
+## Alaska land cover
+```{r}
+alaska_land_cover <- rast("~/Downloads/usa_land_cover_2020v2_30m_tif/ASK_NALCMS_landcover_2020v2_30m/data/ASK_NALCMS_landcover_2020v2_30m.tif")
+plot(alaska_land_cover)
+
+alaska_grid_sf <- st_as_sf(alaska_grid_vect)
+lc_summary_alaska_grid <- exact_extract(alaska_land_cover, alaska_grid_sf, 'frac', progress=TRUE)
+
+
+
+
+lc_summary_cont_grid$farmland <- lc_summary_cont_grid$pasture_frac + lc_summary_cont_grid$crops_frac
+
+
+
+
+
+```
+
+## plot farmland Alaska
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+lc_cont_grid_farmland <- lc_summary_cont_grid$farmland
+cont_grid_sf$farmland <- lc_cont_grid_farmland
+
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = farmland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Farmland") +
+  theme_minimal() +
+  coord_sf()
+
+
+```
+
+
+
+# Land Cover Data (CEC) -- US and Alaska
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+AK_landcover <- rast("~/Downloads/Summer 2025 Project/usa_land_cover_2020v2_30m_tif/ASK_NALCMS_landcover_2020v2_30m/data/ASK_NALCMS_landcover_2020v2_30m.tif")
+# US_landcover <- merge(AK_landcover, US_landcover)
+
+plot(AK_landcover)
+plot(US_landcover)
+
+grid_sf <- st_as_sf(grid_vect)
+lc_summary_grid <- exact_extract(US_landcover, grid_sf, 'frac', progress=TRUE)
+
+
+# plot cropland
+grid_sf$cropland <- lc_summary_grid$frac_15
+
+ggplot(grid_sf) +
+  geom_sf(aes(fill = cropland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Cropland") +
+  theme_minimal() +
+  coord_sf()
+
+```
+
+
+## Alaska cropland graph
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+alaska_grid_sf <- st_as_sf(alaska_grid_vect)
+lc_summary_alaska_grid <- exact_extract(AK_landcover, alaska_grid_sf, 'frac', progress=TRUE)
+alaska_grid_sf$cropland <- lc_summary_alaska_grid$frac_15
+ggplot(alaska_grid_sf) +
+  geom_sf(aes(fill = cropland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Farmland") +
+  theme_minimal() +
+  coord_sf()
+
+
+```

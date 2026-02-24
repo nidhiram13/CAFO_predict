@@ -1,0 +1,133 @@
+---
+title: "GWRF Model"
+author: "Nidhi Ram"
+date: "2025-07-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(dplyr)
+library(tidyverse)
+library(tidycensus)
+library(GWmodel)      ### GW models
+library(sp)           ## Data management
+library(spdep)        ## Spatial autocorrelation
+library(RColorBrewer) ## Visualization
+library(classInt)     ## Class intervals
+library(raster)       ## spatial data
+library(grid)         # plot
+library(gridExtra)    # Multiple plot
+library(ggplot2)      # Multiple plot
+library(gtable)
+library(SpatialML)    # Geographically weigted regression
+
+```
+
+# Load and prepare data
+```{r}
+midwest_grid <- st_transform(midwest_grid, 5070)
+midwest_cafos <- st_transform(midwest_cafos, 5070)
+
+
+known_states <- c("19", "29", "27", "18", "39", "26", "31", "17", "55")
+
+midwest_grid$cafo_count <- lengths(st_intersects(midwest_grid, midwest_cafos))
+midwest_grid$has_data <- substr(midwest_grid$FIPS, 1, 2) %in% known_states # model on data we have
+midwest_grid <- midwest_grid %>%
+  mutate(cafo_count = ifelse(has_data, cafo_count, NA)) # record NA where we know we don't have data
+
+```
+
+# Scale covariates
+```{r}
+midwest_grid2 <- midwest_grid
+midwest_grid2$RUCC_2023 <- as.numeric(midwest_grid2$RUCC_2023)
+midwest_grid2$allocated <- as.numeric(midwest_grid2$allocated)
+midwest_grid2$mean_EJI <- as.numeric(midwest_grid2$mean_EJI)
+midwest_grid2$methane <- as.numeric(midwest_grid2$methane)
+midwest_grid2$pct_ag <- as.numeric(midwest_grid2$pct_ag)
+
+midwest_grid2[, 14:16] = scale(midwest_grid2[, 14:16])
+
+```
+
+```{r}
+predictors <- c("allocated", "RUCC_2023", "mean_EJI", "methane", "pct_ag")
+grid_df <- midwest_grid %>% 
+  dplyr::select(cafo_count, all_of(predictors)) %>%
+  st_drop_geometry() 
+
+
+```
+
+# Scale predictors
+```{r}
+grid_df[, predictors] <- scale(grid_df[, predictors])
+
+```
+
+# Add centroid coordinates
+```{r}
+coords <- st_coordinates(st_centroid(midwest_grid))
+grid_df$X <- coords[,1]
+grid_df$Y <- coords[,2]
+
+
+```
+
+# GWRF Model
+```{r}
+grf_model <- grf(cafo_count ~ allocated + RUCC_2023 + mean_EJI + methane + pct_ag,
+  dframe = grid_df,
+  bw = 50,               # bandwidth in meters (adjust for resolution)
+  ntree = 500,
+  kernel = "adaptive",
+  forests = TRUE,
+  coords = grid_df[, c("X", "Y")])
+
+```
+
+
+
+
+
+# train and test
+```{r}
+predictors <- c("allocated", "RUCC_2023", "mean_EJI", "methane", "pct_ag")
+
+# training (known CAFO count/locations)
+train_sf <- midwest_grid %>%
+  filter(!is.na(cafo_count)) %>%
+  dplyr::select(cafo_count, all_of(predictors))
+
+train_df <- st_drop_geometry(train_sf)
+coords_train <- st_coordinates(st_centroid(train_sf))
+
+# prediction (whole grid)
+predict_sf <- midwest_grid %>%
+  dplyr::select(cafo_count, all_of(predictors))
+
+predict_df <- st_drop_geometry(predict_sf)
+coords_predict <- st_coordinates(st_centroid(predict_sf))
+
+grf_model <- grf(
+  x = train_df,
+  y = "cafo_count",
+  coords = coords_train,
+  x.var.name = predictors,
+  y.var.name = "cafo_count",
+  ntree = 500,
+  mtry = 1,
+  kernel = "gaussian",   # Or "adaptive", depending on your goal
+  bw = 50,               # Bandwidth — tune this!
+  local.w = 1,
+  global.w = 0,
+  importance = "impurity",
+  nthreads = 4
+)
+
+```
+

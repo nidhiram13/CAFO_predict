@@ -1,0 +1,1221 @@
+---
+title: "Data Downscaling 2.0"
+author: "Nidhi Ram"
+date: "2025-06-11"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(tidyverse)
+library(sf) 
+library(ggplot2) 
+library(leaflet) 
+library(dplyr) 
+library(tigris) 
+library(tidyr)
+library(gt)
+library(zipcodeR)
+library(maps)
+library(tidycensus)
+library(terra)
+library(exactextractr)
+library(raster)
+options(scipen = 0.1)
+
+```
+
+```{r, userdirectory, echo = TRUE, message=FALSE, warning=FALSE}
+
+# Set user directory and folder
+user <- "/Users/nidhiram"
+directory <- "/Downloads"
+folder <- "/Summer 2025 Project" 
+
+# Set working directory (make sure all shapefile files are located in the working directory)
+working_directory <- "/Users/nidhiram/Downloads/Summer 2025 Project"
+print(working_directory)
+setwd(working_directory)
+
+```
+
+# Make Grid for whole US
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+us_counties <- counties(cb = TRUE)
+us_counties <- st_transform(us_counties, crs = "EPSG:5070")
+us_counties_vect <- vect(us_counties)
+us_ext <- ext(us_counties_vect)
+grid <- rast(us_ext, resolution = 10000, crs = "EPSG:5070")
+
+grid_vect <- as.polygons(grid)
+
+grid_vect <- mask(grid_vect, us_counties_vect)
+
+plot(grid_vect, border = "grey")
+plot(us_counties_vect, add = TRUE, border = "black")
+
+```
+
+# CONUS grid
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+contiguous_states <- c(
+  "01", "04", "05", "06", "08", "09", "10", "11", "12", "13", "16", "17", 
+  "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", 
+  "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "44", 
+  "45", "46", "47", "48", "49", "50", "51", "53", "54", "55", "56")
+
+us_counties_contiguous <- us_counties %>%
+  filter(STATEFP %in% contiguous_states)
+us_counties_contiguous <- us_counties_contiguous %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+us_counties_contiguous <- st_transform(us_counties_contiguous, crs = "EPSG:5070")
+us_counties_cont_vect <- vect(us_counties_contiguous)
+us_cont_ext <- ext(us_counties_cont_vect)
+cont_grid <- rast(us_cont_ext, resolution = 10000, crs = "EPSG:5070")
+
+cont_grid_vect <- as.polygons(cont_grid)
+
+cont_grid_vect <- mask(cont_grid_vect, us_counties_cont_vect)
+
+plot(cont_grid_vect, border = "gray")
+plot(us_counties_cont_vect, add = TRUE, border = "black")
+
+
+```
+# NLCD Land Cover Data
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+US_landcover <- rast("~/Downloads/Summer 2025 Project/Annual_NLCD_LndCov_2023_CU_C1V0.tif")
+plot(US_landcover)
+
+cont_grid_sf <- st_as_sf(cont_grid_vect)
+lc_summary_grid <- exact_extract(US_landcover, cont_grid_sf, 'frac', progress=TRUE)
+
+```
+
+## CONUS
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+lc_summary_grid <- lc_summary_grid %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+lc_summary_grid <- lc_summary_grid %>%
+  rename(open_water=frac_11, perennial_ice_snow = frac_12, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+cont_grid_sf$farmland <- lc_summary_grid$cropland + lc_summary_grid$pastureland
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = farmland), color = NA) +  
+  scale_fill_viridis_c(option = "plasma", name = "Farmland") +
+  theme_minimal() +
+  coord_sf()
+
+
+```
+
+
+# Downscaling
+
+## Farm Count CONUS
+```{r}
+# census_farm_count
+st_crs(cont_grid_sf)
+us_counties_contiguous <- st_transform(us_counties_contiguous, st_crs(cont_grid_sf))
+
+
+us_counties_contiguous <- us_counties_contiguous %>%
+  left_join(census_farm_count, by = c("GEOID" = "FIPS"))
+
+cont_grid_sf <- st_join(cont_grid_sf, us_counties_contiguous[, c("FIPS", "Number_of_Farms")], left = FALSE) # number of farms per county
+
+# find percent farmland in each county
+cont_grid_sf <- cont_grid_sf %>%
+  group_by(FIPS) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate grid-level predictor: redistributed farm count
+cont_grid_sf <- cont_grid_sf %>%
+  mutate(farm_count = Number_of_Farms * (farmland / total_ag_frac))
+
+
+```
+
+## Plot Farm Count on CONUS grid
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = farm_count), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Farm Count") +
+  theme_minimal() +
+  labs(title = "Redistributed Farm Count per Grid Cell") +
+  coord_sf()
+
+## Original County graph
+ggplot(data = counties_census_farm_count) +
+  geom_sf(aes(fill = Number_of_Farms), color = "black", lwd=0.2) +
+  scale_fill_viridis_c(option = "plasma", na.value = "gray90") +
+  labs(
+    fill = "Number of Farms",
+    title = "Number of Farms by County"
+  ) +
+  theme_minimal()
+
+
+```
+
+## Population Density
+
+## Agriculture Employment CONUS
+```{r}
+st_crs(cont_grid_sf)
+us_counties_contiguous <- st_transform(us_counties_contiguous, st_crs(cont_grid_sf))
+
+us_counties_contiguous <- us_counties_contiguous %>%
+  left_join(ag_wide, by = c("GEOID"))
+
+cont_grid_sf <- st_join(cont_grid_sf, us_counties_contiguous[, c("FIPS", "total_employment")], left = FALSE) # agricultural employment per county
+
+# Calculate grid-level predictor: redistributed livestock units
+cont_grid_sf <- cont_grid_sf %>%
+  mutate(employmnent_redistributed = total_employment * (farmland / total_ag_frac))
+
+cont_grid_sf <- cont_grid_sf %>% rename(employment_redistributed = employmnent_redistributed)
+```
+
+## Plot Redistributed Agricultural Employment on CONUS grid
+```{r, fig.align="center", echo = FALSE, fig.width = 20}
+ggplot(cont_grid_sf) +
+  geom_sf(aes(fill = employment_redistributed), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Farm Count") +
+  theme_minimal() +
+  labs(title = "Redistributed Agricultural Employment per Grid Cell") +
+  coord_sf()
+
+
+## Original County graph
+ag_wide <- ag_wide %>% rename(FIPS = GEOID)
+counties_agricultural_employment <- left_join(us_counties_contiguous, ag_wide, by = "FIPS")
+
+ggplot(data = us_counties_contiguous) +
+  geom_sf(aes(fill = total_employment), color = "black", lwd=0.2) +
+  scale_fill_viridis_c(option = "plasma", na.value = "gray90") +
+  labs(
+    fill = "Agricultural Employment",
+    title = "Agricultural Employment by County"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+# Split CONUS by Region (by Census)
+```{r}
+## Northeast: CT, MA, ME, NH, RI, VT, NJ, PA, NY
+northeast_states <- c("09", "23", "25", "33", "34", "36", "42", "44", "50")
+
+## Midwest: IL, IN, MI, OH, WI, IA, KS, MN, MO, NE, ND, SD
+midwest_states <- c("17", "18", "19", "20", "26", "27", "29", "31", "38", "39", "46", "55")
+
+## South: DE, FL, GA, MD, NC, SC, VA, WV, AL, KY, MS, TN, AR, LA, OK, TX
+south_states <- c("01", "05", "10", "12", "13", "21", "22", "24", "28", "37", "40", "45", "47", "48", "51", "54")
+
+## West: AZ, CO, ID, MT, NV, NM, UT, WY, CA, HI, OR, WA
+west_states <- c("04", "06", "08", "16", "30", "32", "35", "41", "49", "53", "56")
+
+```
+
+## Northeast
+```{r}
+
+us_counties_northeast <- us_counties %>%
+  filter(STATEFP %in% northeast_states)
+us_counties_northeast <- us_counties_northeast %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+us_counties_northeast <- st_transform(us_counties_northeast, crs = "EPSG:5070")
+us_counties_northeast_vect <- vect(us_counties_northeast)
+us_northeast_ext <- ext(us_counties_northeast_vect)
+northeast_grid <- rast(us_northeast_ext, resolution = 10000, crs = "EPSG:5070")
+
+northeast_grid_vect <- as.polygons(northeast_grid)
+
+northeast_grid_vect <- mask(northeast_grid_vect, us_counties_northeast_vect)
+
+plot(northeast_grid_vect, border = "gray")
+plot(us_counties_northeast_vect, add = TRUE, border = "black")
+
+```
+
+## Midwest
+```{r}
+us_counties_midwest <- us_counties %>%
+  filter(STATEFP %in% midwest_states)
+us_counties_midwest <- us_counties_midwest %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+us_counties_midwest <- st_transform(us_counties_midwest, crs = "EPSG:5070")
+us_counties_midwest_vect <- vect(us_counties_midwest)
+us_midwest_ext <- ext(us_counties_midwest_vect)
+midwest_grid <- rast(us_midwest_ext, resolution = 10000, crs = "EPSG:5070")
+
+midwest_grid_vect <- as.polygons(midwest_grid)
+
+midwest_grid_vect <- mask(midwest_grid_vect, us_counties_midwest_vect)
+
+plot(midwest_grid_vect, border = "gray")
+plot(us_counties_midwest_vect, add = TRUE, border = "black")
+
+
+```
+
+## South
+```{r}
+us_counties_south <- us_counties %>%
+  filter(STATEFP %in% south_states)
+us_counties_south <- us_counties_south %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+us_counties_south <- st_transform(us_counties_south, crs = "EPSG:5070")
+us_counties_south_vect <- vect(us_counties_south)
+us_south_ext <- ext(us_counties_south_vect)
+south_grid <- rast(us_south_ext, resolution = 10000, crs = "EPSG:5070")
+
+south_grid_vect <- as.polygons(south_grid)
+
+south_grid_vect <- mask(south_grid_vect, us_counties_south_vect)
+
+plot(south_grid_vect, border = "gray")
+plot(us_counties_south_vect, add = TRUE, border = "black")
+
+
+```
+
+## West
+```{r}
+us_counties_west <- us_counties %>%
+  filter(STATEFP %in% west_states)
+us_counties_west <- us_counties_west %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+us_counties_west <- st_transform(us_counties_west, crs = "EPSG:5070")
+us_counties_west_vect <- vect(us_counties_west)
+us_west_ext <- ext(us_counties_west_vect)
+west_grid <- rast(us_west_ext, resolution = 10000, crs = "EPSG:5070")
+
+west_grid_vect <- as.polygons(west_grid)
+
+west_grid_vect <- mask(west_grid_vect, us_counties_west_vect)
+
+plot(west_grid_vect, border = "gray")
+plot(us_counties_west_vect, add = TRUE, border = "black")
+
+
+```
+
+# Visualize Downscaling by Region
+## Farm Count Northeast
+```{r}
+# census_farm_count
+northeast_grid_sf <- st_as_sf(northeast_grid_vect)
+lc_summary_northeast <- exact_extract(US_landcover, northeast_grid_sf, 'frac', progress=TRUE)
+
+lc_summary_northeast <- lc_summary_northeast %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+lc_summary_northeast <- lc_summary_northeast %>%
+  rename(open_water=frac_11, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+northeast_grid_sf$farmland <- lc_summary_northeast$cropland + lc_summary_northeast$pastureland
+
+
+us_counties_northeast <- st_transform(us_counties_northeast, st_crs(northeast_grid_sf))
+
+us_counties_northeast <- us_counties_northeast %>%
+  left_join(census_farm_count, by = c("GEOID" = "FIPS"))
+
+northeast_grid_sf <- st_join(northeast_grid_sf, us_counties_northeast[, c("FIPS", "Number_of_Farms")], left = FALSE) # number of farms per county
+
+# find percent farmland in each county
+northeast_grid_sf <- northeast_grid_sf %>%
+  group_by(FIPS) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate grid-level predictor: redistributed farm count
+northeast_grid_sf <- northeast_grid_sf %>%
+  mutate(farm_count = Number_of_Farms * (farmland / total_ag_frac))
+
+
+```
+
+## Plot Farm Count on Northeast grid
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(northeast_grid_sf) +
+  geom_sf(aes(fill = farm_count), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Farm Count") +
+  theme_minimal() +
+  labs(title = "Redistributed Farm Count per Grid Cell") +
+  coord_sf()
+
+```
+
+## Farm Count Midwest
+```{r}
+# census_farm_count
+midwest_grid_sf <- st_as_sf(midwest_grid_vect)
+lc_summary_midwest <- exact_extract(US_landcover, midwest_grid_sf, 'frac', progress=TRUE)
+
+lc_summary_midwest <- lc_summary_midwest %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+lc_summary_midwest <- lc_summary_midwest %>%
+  rename(open_water=frac_11, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+midwest_grid_sf$farmland <- lc_summary_midwest$cropland + lc_summary_midwest$pastureland
+
+us_counties_midwest <- st_transform(us_counties_midwest, st_crs(midwest_grid_sf))
+
+us_counties_midwest <- us_counties_midwest %>%
+  left_join(census_farm_count, by = c("GEOID" = "FIPS"))
+
+midwest_grid_sf <- st_join(midwest_grid_sf, us_counties_midwest[, c("FIPS", "Number_of_Farms")], left = FALSE) # number of farms per county
+
+# find percent farmland in each county
+midwest_grid_sf <- midwest_grid_sf %>%
+  group_by(FIPS) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate grid-level predictor: redistributed farm count
+midwest_grid_sf <- midwest_grid_sf %>%
+  mutate(farm_count = Number_of_Farms * (farmland / total_ag_frac))
+
+
+```
+
+## Plot Farm Count on Midwest grid
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(midwest_grid_sf) +
+  geom_sf(aes(fill = farm_count), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Farm Count") +
+  theme_minimal() +
+  labs(title = "Redistributed Farm Count per Grid Cell") +
+  coord_sf()
+
+```
+
+## Farm Count South
+```{r}
+# census_farm_count
+south_grid_sf <- st_as_sf(south_grid_vect)
+lc_summary_south <- exact_extract(US_landcover, south_grid_sf, 'frac', progress=TRUE)
+
+lc_summary_south <- lc_summary_south %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+lc_summary_south <- lc_summary_south %>%
+  rename(open_water=frac_11, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+south_grid_sf$farmland <- lc_summary_south$cropland + lc_summary_south$pastureland
+
+us_counties_south <- st_transform(us_counties_south, st_crs(south_grid_sf))
+
+us_counties_south <- us_counties_south %>%
+  left_join(census_farm_count, by = c("GEOID" = "FIPS"))
+
+south_grid_sf <- st_join(south_grid_sf, us_counties_south[, c("FIPS", "Number_of_Farms")], left = FALSE) # number of farms per county
+
+# find percent farmland in each county
+south_grid_sf <- south_grid_sf %>%
+  group_by(FIPS) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate grid-level predictor: redistributed farm count
+south_grid_sf <- south_grid_sf %>%
+  mutate(farm_count = Number_of_Farms * (farmland / total_ag_frac))
+
+
+```
+
+## Plot Farm Count on South grid
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(south_grid_sf) +
+  geom_sf(aes(fill = farm_count), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Farm Count") +
+  theme_minimal() +
+  labs(title = "Redistributed Farm Count per Grid Cell") +
+  coord_sf()
+
+```
+
+## Farm Count West
+```{r}
+# census_farm_count
+west_grid_sf <- st_as_sf(west_grid_vect)
+lc_summary_west <- exact_extract(US_landcover, west_grid_sf, 'frac', progress=TRUE)
+
+lc_summary_west <- lc_summary_west %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+lc_summary_west <- lc_summary_west %>%
+  rename(open_water=frac_11, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+west_grid_sf$farmland <- lc_summary_west$cropland + lc_summary_west$pastureland
+
+us_counties_west <- st_transform(us_counties_west, st_crs(west_grid_sf))
+
+us_counties_west <- us_counties_west %>%
+  left_join(census_farm_count, by = c("GEOID" = "FIPS"))
+
+west_grid_sf <- st_join(west_grid_sf, us_counties_west[, c("FIPS", "Number_of_Farms")], left = FALSE) # number of farms per county
+
+# find percent farmland in each county
+west_grid_sf <- west_grid_sf %>%
+  group_by(FIPS) %>%
+  mutate(total_ag_frac = sum(farmland, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate grid-level predictor: redistributed farm count
+west_grid_sf <- west_grid_sf %>%
+  mutate(farm_count = Number_of_Farms * (farmland / total_ag_frac))
+
+
+```
+
+## Plot Farm Count on West grid
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+ggplot(west_grid_sf) +
+  geom_sf(aes(fill = farm_count), color = NA) +
+  scale_fill_viridis_c(option = "plasma", name = "Estimated Farm Count") +
+  theme_minimal() +
+  labs(title = "Redistributed Farm Count per Grid Cell - West") +
+  coord_sf()
+
+```
+
+
+# IDM: Intelligent Dasymetric Mapping
+
+## Farm Count CONUS
+```{r}
+uninhabited_classes <- c("open_water", "perennial_ice_snow", "barren", "woody_wetlands", "herbaceous_wetlands")
+
+# mask, 1 = uninhabited, NA = habitable
+uninhabited_mask <- classify(US_landcover, rbind(cbind(match(uninhabited_classes, levels(US_landcover)[[1]]), 1)))
+landcover_masked <- mask(US_landcover, uninhabited_mask, maskvalue = 1)
+
+```
+
+
+```{r}
+lc_summary_northeast <- lc_summary_northeast %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+lc_summary_northeast <- lc_summary_northeast %>%
+  rename(open_water=frac_11, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+
+lc_key <- data.frame(
+  code = c(11, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95),
+  label = c("open_water", "developed_open", "developed_low", "developed_medium", 
+            "developed_high", "barren", "deciduous_forest", 
+            "evergreen_forest", "mixed_forest", "shrub", "grassland",
+            "pastureland", "cropland", "woody_wetlands", "herbaceous_wetlands"))
+
+ag_farm_classes <- c(81, 82)
+ag_mask <- US_landcover %in% ag_farm_classes
+
+# Uninhabited classes (water, barren, woody wetlands, herbaceous wetlands)
+uninhabited_classes <- c(11, 31, 90, 95)
+uninhabited_mask <- US_landcover %in% uninhabited_classes
+landcover_masked <- mask(US_landcover, uninhabited_mask, maskvalue = 1)
+
+ag_rasters <- lapply(ag_farm_classes, function(class) {
+  landcover_masked == class})
+
+
+# Calculate proportion of each ag class in each source unit
+ag_proportions <- lapply(ag_rasters, function(r) {
+  exact_extract(r, us_counties_contiguous, 'mean')})
+
+names(ag_proportions) <- ag_farm_classes
+ag_df <- as.data.frame(ag_proportions)
+
+ag_df <- ag_df %>%
+  rename(pastureland = X81, cropland = X82)
+
+# Combine with source unit data
+us_counties_contiguous <- cbind(us_counties_contiguous, ag_df)
+```
+
+### Training Zones - Empirical Sampling
+```{r}
+
+training_threshold <- 0.9
+densities <- list()
+
+us_counties_contiguous <- us_counties_contiguous %>%
+  rename(`81` = pastureland, `82` = cropland)
+
+training_units <- us_counties_contiguous[us_counties_contiguous[["81"]] > training_threshold, ]
+total_farms <- sum(training_units$Number_of_Farms)
+total_ag_area <- sum(training_units[["81"]] * st_area(training_units))
+densities[["81"]] <- as.numeric(total_farms / total_ag_area)  # farms per m²
+
+
+for (class in ag_farm_classes) {
+  training_units <- us_counties_contiguous[us_counties_contiguous[[class]] > training_threshold, ]
+  total_farms <- sum(training_units$Number_of_Farms)
+  total_ag_area <- sum(training_units[[class]] * st_area(training_units))
+  densities[[class]] <- as.numeric(total_farms / total_ag_area)  # farms per m²
+}
+
+```
+
+
+
+# Try 2: IDM for Minnesota - success
+```{r}
+minnesota_counties <- us_counties %>%
+  filter(STATEFP == 27)
+
+minnesota_counties <- minnesota_counties %>%
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))  
+
+minnesota_counties <- st_transform(minnesota_counties, crs = "EPSG:5070")
+minnesota_counties_vect <- vect(minnesota_counties)
+minnesota_ext <- ext(minnesota_counties_vect)
+minnesota_grid <- rast(minnesota_ext, resolution = 10000, crs = "EPSG:5070")
+
+minnesota_grid_vect <- as.polygons(minnesota_grid)
+
+minnesota_grid_vect <- mask(minnesota_grid_vect, minnesota_counties_vect)
+
+plot(minnesota_grid_vect, border = "gray")
+plot(minnesota_counties_vect, add = TRUE, border = "black")
+
+
+```
+
+```{r}
+minnesota_grid_sf <- st_as_sf(minnesota_grid_vect)
+lc_summary_minnesota <- exact_extract(US_landcover, minnesota_grid_sf, 'frac', progress=TRUE)
+
+lc_summary_minnesota <- lc_summary_minnesota %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+lc_summary_minnesota <- lc_summary_minnesota %>%
+  rename(open_water=frac_11, developed_open = frac_21, developed_low = frac_22, developed_medium = frac_23, developed_high = frac_24, barren = frac_31, deciduous_forest = frac_41, evergreen_forest = frac_42, mixed_forest = frac_43, shrub = frac_52, grassland = frac_71, woody_wetlands = frac_90, herbaceous_wetlands = frac_95)
+
+minnesota_grid_sf$farmland <- lc_summary_minnesota$cropland + lc_summary_minnesota$pastureland
+
+
+minnesota_counties <- st_transform(minnesota_counties, st_crs(minnesota_grid_sf))
+
+minnesota_counties <- minnesota_counties %>%
+  left_join(census_farm_count, by = c("GEOID" = "FIPS"))
+
+```
+### Training Zones - Empirical Sampling?
+```{r}
+# uninhabited_classes <- c("open_water", "perennial_ice_snow", "barren", "woody_wetlands", "herbaceous_wetlands")
+lc_summary_minnesota <- lc_summary_minnesota %>%
+  mutate(uninhabited = open_water + barren + woody_wetlands + herbaceous_wetlands)
+minnesota_grid_sf$uninhabited <- lc_summary_minnesota$uninhabited
+
+
+lc_mn_counties_summary <- exact_extract(US_landcover, minnesota_counties, 'frac', progress = TRUE)
+lc_mn_counties_summary <- lc_mn_counties_summary %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+minnesota_counties$cropland <- lc_mn_counties_summary$cropland
+minnesota_counties$pastureland <- lc_mn_counties_summary$pastureland
+
+mn_ag_model <- lm(Number_of_Farms ~ cropland + pastureland, data = minnesota_counties)
+summary(mn_ag_model)
+
+densities <- coef(mn_ag_model)
+density_cropland <- densities["cropland"]
+density_pastureland <- densities["pastureland"]
+
+lc_summary_minnesota <- lc_summary_minnesota %>%
+  mutate(weight_cropland = cropland * density_cropland,
+         weight_pastureland = pastureland * density_pastureland,
+         total_weight = weight_cropland + weight_pastureland)
+
+minnesota_grid_sf$cropland <- lc_summary_minnesota$cropland
+minnesota_grid_sf$pastureland <- lc_summary_minnesota$pastureland
+
+minnesota_grid_sf <- minnesota_grid_sf %>%
+  mutate(weight_cropland = cropland * density_cropland,
+         weight_pastureland = pastureland * density_pastureland,
+         total_weight = weight_cropland + weight_pastureland)
+
+# uninhabited area masking
+minnesota_grid_sf <- minnesota_grid_sf %>%
+  mutate(total_weight = ifelse(uninhabited >= 0.99, 0, total_weight))
+
+
+# Step 1: Assign by centroid (fast and usually sufficient)
+mn_grid_centroids <- st_centroid(minnesota_grid_sf)
+
+mn_grid_with_fips <- st_join(mn_grid_centroids,
+  dplyr::select(minnesota_counties, FIPS),
+  join = st_within)
+
+# Step 2: Identify grid cells with no county assigned
+mn_missing <- is.na(mn_grid_with_fips$FIPS)
+
+# Step 3: Assign missing grid cells by spatial intersection using the **original grid geometry**
+mn_grid_intersect <- st_join(minnesota_grid_sf[mn_missing, ],  
+  dplyr::select(minnesota_counties, FIPS),
+  join = st_intersects,
+  left = FALSE)
+
+# Step 4: Update FIPS values for missing grid cells
+mn_grid_with_fips$FIPS[mn_missing] <- mn_grid_intersect$FIPS
+
+# Step 5: Transfer FIPS codes to the original grid
+minnesota_grid_sf$FIPS <- mn_grid_with_fips$FIPS
+
+
+minnesota_grid_sf <- minnesota_grid_sf %>%
+  left_join(minnesota_counties %>%
+      dplyr::select(FIPS, Number_of_Farms) %>%
+      st_drop_geometry(), by = "FIPS")
+
+
+# Scale allocations within each county
+minnesota_grid_sf <- minnesota_grid_sf %>%
+  group_by(FIPS) %>%
+  mutate(scaling_factor = Number_of_Farms / sum(total_weight, na.rm = TRUE),
+         farms_allocated = total_weight * scaling_factor) %>%
+  ungroup()
+```
+
+## Plot
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+library(gridExtra)
+g1 <- ggplot(minnesota_grid_sf) +
+  geom_sf(aes(fill = farms_allocated)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "IDM-Allocated Number of Farms  (Minnesota)",
+       fill = "Farms per Grid Cell")
+
+g2 <- ggplot(minnesota_counties) +
+  geom_sf(aes(fill = Number_of_Farms)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = " Number of Farms  (Minnesota)",
+       fill = "Farms per County")
+
+library(gridExtra)
+grid.arrange(g1, g2, ncol=2, nrow =1)
+
+# Validation
+minnesota_grid_sf %>%
+  group_by(FIPS) %>%
+  summarize(
+    allocated_farms = sum(farms_allocated, na.rm = TRUE),
+    original_farms = first(Number_of_Farms),
+    difference = allocated_farms - original_farms
+  )
+
+```
+
+# Outbreaks
+```{r}
+outbreaks <- read.csv("~/Downloads/Summer 2025 Project/hpai-outbreaks-clean-placeholder-032124.csv", stringsAsFactors = FALSE)
+outbreaks_clean <- outbreaks %>%
+  filter(!is.na(lat) & !is.na(lon))
+
+# Convert outbreaks data to an sf object
+outbreaks_sf <- st_as_sf(outbreaks_clean, coords = c("lon", "lat"), crs = 4326)
+outbreaks_sf <- outbreaks_sf %>%
+  filter(state != "AK")
+
+# Minnesota
+mn_outbreaks <- outbreaks_sf %>%
+  filter(state == "MN") # Filter outbreaks to Minnesota
+
+minnesota_counties <- st_transform(minnesota_counties, crs = st_crs(mn_outbreaks))
+
+
+# Create a leaflet map with unique popups for each outbreak
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>% # Add a basemap
+  addPolygons(data = minnesota_counties, 
+              color = "black", 
+              weight = 1, 
+              fill = F,
+              group = "Minnesota Counties") %>%
+  addCircleMarkers(data = mn_outbreaks,
+                   radius = 4,
+                   color = "red",
+                   popup = ~paste(
+                     "<b>Outbreak Details:</b><br>",
+                     paste0("Latitude: ", st_coordinates(geometry)[, 2], "<br>"),
+                     paste0("Longitude: ", st_coordinates(geometry)[, 1], "<br>"),
+                     ifelse(!is.na(date_confirmed), paste0("date_confirmed: ", date_confirmed, "<br>"), ""),
+                     ifelse(!is.na(production_type), paste0("production_type: ", production_type, "<br>"), "")
+                   ),
+                   group = "Outbreaks") %>%
+  addLayersControl(overlayGroups = c("Minnesota Counties", "Outbreaks"),
+                   options = layersControlOptions(collapsed = FALSE))
+
+
+
+```
+
+## MN feedlots
+```{r}
+mn_feedlots_sf <- st_read("~/Downloads/Summer 2025 Project/MN_feedlots/feedlots.shp") 
+mn_feedlots_sf <- st_transform(mn_feedlots_sf, crs = st_crs(mn_outbreaks))
+mn_feedlots_sf <- st_transform(mn_feedlots_sf, crs = 5070)
+mn_feedlots_sf <- mn_feedlots_sf %>%
+  dplyr::select(
+    # Uncomment the columns you want to keep
+    
+     "item_id", # lets keep the item_id
+     
+    # "ai_id",
+    # "int_doc_id",
+    # "si_cat",
+    # "si_id",
+    
+     "name", # lets keep the name of the feedlot
+    
+    # "program_li",
+    # "status_fdl",
+    # "activity_r",
+    # "num_reg",
+    # "co_num_reg",
+    # "title_reg",
+    # "type_reg",
+    # "start_d_re",
+    # "end_d_reg",
+    # "active_reg",
+    # "permit_fla",
+    # "activity_p",
+    # "num_per",
+    # "title_per",
+    # "type_per",
+    # "start_d_pe",
+    # "end_d_per",
+    # "cafo_flag",
+    # "owner",
+    # "phone_owne",
+    # "addr_m_own",
+    # "city_m_own",
+    # "state_m_ow",
+    # "zip_m_owne",
+    # "contact",
+    # "phone_cont",
+    # "addr_m_con",
+    # "city_m_con",
+    # "state_m_co",
+    # "zip_m_cont",
+    # "addr_p_fee",
+    # "city_p_fee",
+    # "state_p_fe",
+    # "zip_p_feed",
+     "county_cod", # Keep county FIPS
+     "county_nam", # Keep county name
+    # "cong_dist",
+    # "house_dist",
+    # "senate_dis",
+    # "huc8",
+    # "huc8_name",
+    # "huc10",
+    # "huc10_name",
+    # "huc12",
+    # "huc12_name",
+    # "dwsma_code",
+    # "dwsma_name",
+    # "loc_desc",
+    # "trdsqq",
+    # "pls_townsh",
+    # "range",
+    # "range_dir",
+    # "section",
+    # "quarters",
+    # "latitude",
+    # "longitude",
+    # "method_cod",
+    # "method_des",
+    # "ref_code",
+    # "ref_desc",
+    # "verified_f",
+    # "collection",
+    # "open_lot_f",
+    # "building_f",
+    # "pasture_fl",
+    # "lq_store_f",
+    # "lq_s_close",
+    # "sol_store_",
+    # "sol_s_clos",
+    # "river_stre",
+    # "shoreland_",
+    # "h_well_dis",
+    # "m_well_dis",
+    # "last_anima",
+    # "waterbody_",
+    
+     "au_count", # Lets keep the animal count (this is weighted by the weight of the animals in the feedlot)
+    
+    # "animal_cou",
+    
+     "primary_st",# Lets keep this, this corresponds to the primary stock in the feedlot
+    
+     "birds_au", # Lets keep just the bird animal count
+    
+     "bovines_au", # Lets keep just the bovines animal count
+    
+    # "deerelk_au",
+    # "goatsheep_",
+    # "horses_au",
+    # "lamaalpac_",
+    
+     "pigs_au", # we will also keep the pig animal count
+    
+    # "other_au",
+    # "cattle_dl",
+    # "heifer_d",
+    # "calf_d",
+    # "cattle_db",
+    # "steer_b",
+    # "heifer_b",
+    # "cow_calf_b",
+    # "calf_b",
+    # "bull_matur",
+    # "veal_calf",
+    # "swine_big",
+    # "swine_medi",
+    # "swine_litt",
+    # "horse",
+    # "sheep",
+    # "chx_lm",
+    # "chx_b_big",
+    # "chx_b_litt",
+    # "chx_l_big",
+    # "chx_l_litt",
+    # "turkey_big",
+    # "turkey_lit",
+    # "duck",
+    # "duck_lm",
+    # "alpacas",
+    # "bison",
+    # "bison_calf",
+    # "camels",
+    # "deer",
+    # "donkey_mul",
+    # "elk",
+    # "emus_ostri",
+    # "peacocks",
+    # "fowl",
+    # "foxes",
+    # "geese",
+    # "goats",
+    # "goats_smal",
+    # "ponies",
+    # "llamas",
+    # "mink",
+    # "rabbits",
+    # "reindeer_c",
+    # "unknown",
+    # "au_cat_dl",
+    # "au_hef_d",
+    # "au_calf_d",
+    # "au_cat_db",
+    # "au_steer_b",
+    # "au_hef_b",
+    # "au_cwcal_b",
+    # "au_calf_b",
+    # "au_bull_ma",
+    # "au_veal_ca",
+    # "au_swine_b",
+    # "au_swine_m",
+    # "au_swine_l",
+    # "au_horse",
+    # "au_sheep",
+    # "au_chx_lm",
+    # "au_chx_bbi",
+    # "au_chx_bli",
+    # "au_chx_lbi",
+    # "au_chx_lli",
+    # "au_turk_bi",
+    # "au_turk_li",
+    # "au_duck",
+    # "au_duck_lm",
+    # "au_alpacas",
+    # "au_bison",
+    # "au_bison_c",
+    # "au_camels",
+    # "au_deer",
+    # "au_donkey_",
+    # "au_elk",
+    # "au_emus_os",
+    # "au_peacock",
+    # "au_fowl",
+    # "au_foxes",
+    # "au_geese",
+    # "au_goats",
+    # "au_goats_s",
+    # "au_ponies",
+    # "au_llamas",
+    # "au_mink",
+    # "au_rabbits",
+    # "au_reindee",
+    # "au_unknown",
+    # "category_f",
+    # "type_fdlt",
+    # "reg_requir",
+    # "reg_curren",
+    # "per_class",
+    # "per_active",
+    # "npdes_sds",
+    
+    "geometry" # Geometry column, required for sf objects
+  )
+
+colnames(mn_feedlots_sf) <- colnames(mn_feedlots_sf) %>%
+  gsub("primary_st", "primary_stock", .)
+
+# Example: Rename multiple columns if needed
+colnames(mn_feedlots_sf) <- colnames(mn_feedlots_sf) %>%
+  gsub("county_cod", "county_code", .) %>%
+  gsub("county_nam", "county_name", .) %>%
+  gsub("au_count", "animal_units", .) %>%
+  gsub("birds_au", "birds_animal_units", .) %>%
+  gsub("bovines_au", "bovine_animal_units", .) %>%
+  gsub("pigs_au", "pigs_animal_units", .)
+
+
+```
+
+# Map of MN Feedlots and Outbreaks
+```{r}
+ggplot() +
+  geom_sf(data = minnesota_counties, fill = "lightblue", color = "black", size = 0.2) + # Contiguous counties
+    geom_sf(data = mn_feedlots_sf, aes(color = "Feedlots"), size = 0.1) +
+  geom_sf(data = mn_outbreaks, aes(color = "Outbreaks"), size = 1) +                       # Outbreak points
+  scale_color_manual(values = c("Outbreaks" = "red", "Feedlots" = "blue")) +                # Custom colors
+  labs(title = "HPAI Outbreaks and Feedlots in Minnesota",
+       color = "Legend") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) # Centered title
+
+
+```
+
+
+# Map of MN Feedlots and Redistributed Farm Count
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+g3 <- ggplot() +
+  geom_sf(data = grid_test, aes(fill = allocated)) +
+  geom_sf(data = mn_feedlots_sf, aes(color = "Feedlots"), size = 0.1, alpha = 0.1) +
+  scale_fill_viridis_c(option = "C") +
+  scale_color_manual(values = c("Feedlots" = "white")) +                # Custom colors
+  theme_minimal() +
+  labs(title = "IDM-Allocated Farm Count and Feedlots in MN",
+       fill = "Farms per Grid Cell", color = "Legend") + 
+    theme(plot.title = element_text(hjust = 0.5)) # Centered title
+
+grid.arrange(g1, g3, nrow=1, ncol=2)
+
+```
+
+
+# IDM for Midwest
+### Training Zones - Empirical Sampling?
+```{r}
+# uninhabited_classes <- c("open_water", "perennial_ice_snow", "barren", "woody_wetlands", "herbaceous_wetlands")
+lc_summary_midwest <- lc_summary_midwest %>%
+  mutate(uninhabited = open_water + barren + woody_wetlands + herbaceous_wetlands)
+midwest_grid_sf$uninhabited <- lc_summary_midwest$uninhabited
+
+
+lc_midwest_counties_summary <- exact_extract(US_landcover, us_counties_midwest, 'frac', progress = TRUE)
+lc_midwest_counties_summary <- lc_midwest_counties_summary %>%
+  rename(pastureland = frac_81, cropland = frac_82)
+
+us_counties_midwest$cropland <- lc_midwest_counties_summary$cropland
+us_counties_midwest$pastureland <- lc_midwest_counties_summary$pastureland
+
+midwest_ag_model <- lm(Number_of_Farms ~ cropland + pastureland, data = us_counties_midwest)
+summary(midwest_ag_model)
+
+densities_midwest <- coef(midwest_ag_model)
+density_cropland_midwest <- densities["cropland"]
+density_pastureland_midwest <- densities["pastureland"]
+
+lc_summary_midwest <- lc_summary_midwest %>%
+  mutate(weight_cropland = cropland * density_cropland_midwest,
+         weight_pastureland = pastureland * density_pastureland_midwest,
+         total_weight = weight_cropland + weight_pastureland)
+
+midwest_grid_sf$cropland <- lc_summary_midwest$cropland
+midwest_grid_sf$pastureland <- lc_summary_midwest$pastureland
+
+midwest_grid_sf <- midwest_grid_sf %>%
+  mutate(weight_cropland = cropland * density_cropland,
+         weight_pastureland = pastureland * density_pastureland,
+         total_weight = weight_cropland + weight_pastureland)
+
+# uninhabited area masking
+midwest_grid_sf <- midwest_grid_sf %>%
+  mutate(total_weight = ifelse(uninhabited >= 0.99, 0, total_weight))
+
+
+# Step 1: Assign by centroid (fast and usually sufficient)
+midwest_grid_centroids <- st_centroid(midwest_grid)
+
+midwest_grid_with_fips <- st_join(midwest_grid_centroids,
+  dplyr::select(us_counties_midwest, FIPS),
+  join = st_within)
+
+# Step 2: Identify grid cells with no county assigned
+midwest_missing <- is.na(midwest_grid_with_fips$FIPS)
+
+# Step 3: Assign missing grid cells by spatial intersection using the **original grid geometry**
+midwest_grid_intersect <- st_join(midwest_grid[midwest_missing, ],  
+  dplyr::select(us_counties_midwest, FIPS),
+  join = st_intersects,
+  left = FALSE)
+
+# Step 4: Update FIPS values for missing grid cells
+midwest_grid_with_fips$FIPS[midwest_missing] <- midwest_grid_intersect$FIPS
+
+# Step 5: Transfer FIPS codes to the original grid
+midwest_grid$FIPS <- midwest_grid_with_fips$FIPS
+
+
+midwest_grid <- midwest_grid %>%
+  left_join(us_counties_midwest %>%
+      dplyr::select(FIPS, Number_of_Farms) %>%
+      st_drop_geometry(), by = "FIPS")
+
+
+# Scale allocations within each county
+midwest_grid_sf <- midwest_grid_sf %>%
+  group_by(FIPS) %>%
+  mutate(scaling_factor = Number_of_Farms / sum(total_weight, na.rm = TRUE),
+         farms_allocated = total_weight * scaling_factor) %>%
+  ungroup()
+```
+
+
+## Plot
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+library(gridExtra)
+midwest1 <- ggplot(midwest_grid_sf) +
+  geom_sf(aes(fill = farms_allocated)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "IDM-Allocated Number of Farms  (Midwest)",
+       fill = "Farms per Grid Cell")
+
+midwest2 <- ggplot(us_counties_midwest) +
+  geom_sf(aes(fill = Number_of_Farms)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = " Number of Farms  (Minnesota)",
+       fill = "Farms per County")
+
+grid.arrange(midwest1, midwest2, ncol=2, nrow =1)
+
+# Validation
+midwest_validation <- midwest_grid_sf %>%
+  group_by(FIPS) %>%
+  summarize(
+    allocated_farms = sum(farms_allocated, na.rm = TRUE),
+    original_farms = first(Number_of_Farms),
+    difference = allocated_farms - original_farms
+  )
+print(midwest_validation)
+sum(midwest_validation$difference, na.rm=TRUE) ## very small!
+
+```
+
+# Compile CAFOs - Midwest
+```{r}
+cafo_compiled <- st_read("cafo_state_subset_with_coords/cafo_state_subset.shp")
+cafo_compiled <- cafo_compiled[cafo_compiled$state_name != "Texas", ]
+cafo_compiled <- st_transform(cafo_compiled, crs = 5070)
+wi_cafos <- st_transform(wi_cafos, crs = 5070) # wisconsin
+mn_cafos <- st_transform(mn_cafos, crs = 5070) #minnesota
+ny_cafos <- st_transform(ny_cafos, crs = 5070) #new york
+la_cafos <- st_transform(la_cafos, crs = 5070) #louisiana
+al_cafos <- st_transform(al_cafos, crs = 5070) # alabama
+ar_cafos <- st_transform(ar_cafos, crs = 5070) #arkansas
+co_cafos <- st_transform(co_cafos, crs = 5070) #colorado
+fl_cafos <- st_transform(fl_cafos, crs = 5070) #floria
+ga_cafos <- st_transform(ga_cafos, crs = 5070) #georgia
+il_cafos <- st_transform(il_cafos, crs = 5070) #illinois
+mo_cafos <- st_transform(mo_cafos, crs = 5070) #missouri
+ms_cafos <- st_transform(ms_cafos, crs = 5070) #mississippi
+ne_cafos <- st_transform(ne_cafos, crs = 5070) #nebraska
+tx_cafos <- st_transform(tx_cafos, crs = 5070)# texas
+ca_cafos <- st_transform(ca_cafos, crs = 5070) #california
+
+combined_cafos <- bind_rows(cafo_compiled, wi_cafos, mn_cafos, ne_cafos, il_cafos, mo_cafos, ny_cafos, la_cafos, al_cafos, ar_cafos,  co_cafos, fl_cafos, ga_cafos, ms_cafos, tx_cafos)
+combined_cafos <- bind_rows(combined_cafos, wa_cafos)
+combined_cafos <- bind_rows(combined_cafos, ca_cafos)
+
+ggplot() +
+  geom_sf(data = us_counties_contiguous, fill = "lightgray", color = "black", size = 0.2) + 
+  geom_sf(data = combined_cafos, aes(color = "CAFOs"), size = 1) + 
+  scale_color_manual(values = c("CAFOs" = "black")) +
+  labs(color = "", family = "Helvetica") +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) + 
+  theme_minimal() + 
+  theme(plot.title = element_text(hjust = 0.5, family = "Helvetica"))
+
+```
+
+## Plot Midwest CAFOs
+Illinois(x), Indiana, Iowa, Kansas, Michigan, Minnesota(x), Missouri(x), Nebraska(x), North Dakota, Ohio, South Dakota, and Wisconsin(x)
+```{r}
+midwest_cafo_states <- c("Iowa", "Missouri", "Minnesota", "Indiana", "Ohio", "Michigan", "Wisconsin", "Nebraska", "Illinois")
+midwest_cafos <- combined_cafos %>% filter(state_name %in% midwest_cafo_states)
+
+duplicate_geometries <- duplicated(st_geometry(midwest_cafos))
+midwest_cafos2 <- midwest_cafos[!(duplicated(st_geometry(midwest_cafos))), ]
+
+
+mn_feedlots_sf <- st_transform(mn_feedlots_sf, crs=5070)
+midwest_cafos <- bind_rows(midwest_cafos, mn_feedlots_sf)
+
+ggplot() +
+  geom_sf(data = us_counties_midwest, fill = "lightblue", color = "black", size = 0.2) + 
+  geom_sf(data = midwest_cafos, aes(color = "CAFOs"), size = 0.001) + 
+  scale_color_manual(values = c("CAFOs" = "red")) +
+  labs(title = "CAFO Locations in Midwestern US",
+       color = "Legend") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+```
+# Midwest CAFOs and Redistributed Farm Count Plot
+```{r, fig.align="center", echo = FALSE, fig.width = 24}
+midwest3 <- ggplot() +
+  geom_sf(data = midwest_grid_sf, aes(fill = farms_allocated)) +
+  geom_sf(data = midwest_cafos, aes(color = "CAFOs/Feedlots"), size = 0.6, alpha = 0.1) +
+  scale_fill_viridis_c(option = "C") +
+  scale_color_manual(values = c("CAFOs/Feedlots" = "green")) +                # Custom colors
+  theme_minimal() +
+  labs(title = "IDM-Allocated Farm Count and Feedlots in Midwestern US",
+       fill = "Farms per Grid Cell", color = "Legend") + 
+    theme(plot.title = element_text(hjust = 0.5)) # Centered title
+
+grid.arrange(midwest1, midwest3, nrow=1, ncol=2)
+
+```
+
+
+
+illinois, kansas, nebraska, north dakota, south dakota

@@ -1,0 +1,642 @@
+---
+title: "model2_gwrf"
+author: "Nidhi Ram"
+date: "2025-07-21"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(terra)
+library(sf)
+library(dplyr)
+library(tidyverse)
+library(mlr3verse)         #metapackage for mlr3 modeling
+library(mlr3spatiotempcv)  # for spatial cross-validation
+library(CAST)              # for area of applicability
+library(data.table)
+lgr::get_logger("mlr3")$set_threshold("warn")
+library(blockCV)
+```
+
+# Prepare data
+```{r}
+midwest_grid <- st_transform(midwest_grid, 5070)
+midwest_cafos2 <- st_transform(midwest_cafos2, 5070)
+# grid_train <- midwest_grid %>% filter(has_data)
+midwest_grid$cafo_count <- lengths(st_intersects(midwest_grid, midwest_cafos2))
+
+minnesota_grid <- st_transform(minnesota_grid, 5070)
+mn_cafos <- st_transform(mn_cafos, 5070)
+known_states <- fips(state = midwest_cafo_states)
+minnesota_grid$cafo_count <- lengths(st_intersects(minnesota_grid, mn_cafos))
+midwest_grid$has_data <- substr(midwest_grid$FIPS, 1, 2) %in% known_states # model on data we have
+midwest_grid <- midwest_grid %>%
+  mutate(cafo_count = ifelse(has_data, cafo_count, NA)) # record NA where we know we don't have data
+
+grid_train <- minnesota_grid %>% filter(has_data)
+
+```
+
+# Model specification
+```{r}
+minnesota_grid$road_length <- as.numeric(minnesota_grid$road_length)
+features <- c("allocated", "mean_EJI", "methane", "var1.pred.x", "allocated_pop_density", "ag_employment") 
+grid_train <- grid_train[, c(features, "cafo_count")]
+grid_train_points <- grid_train %>%
+  st_centroid()
+
+minnesota_grid3 <- minnesota_grid2[, c(features, "cafo_count")]
+
+task <- mlr3spatiotempcv::as_task_regr_st(st_centroid(minnesota_grid3), target = "cafo_count")
+train_test_split <- mlr3::partition(task, ratio = 0.7)
+learner <- mlr3::lrn("regr.ranger", num.trees = 100, importance = "impurity",
+                     mtry = 5, min.node.size = 5, splitrule = "variance")
+resampling <- mlr3::rsmp("spcv_block", folds = 5, cols = 10, rows = 10)
+
+
+```
+
+# Modeling
+```{r}
+learner$train(task, row_ids = train_test_split$train)
+learner$model
+
+model_mlr3 <- mlr3::resample(task = task, learner = learner, resampling = resampling)
+learner$train(task)
+
+```
+
+# Evaluation
+```{r}
+my_measures <- c(mlr3::msr("regr.rmse"), mlr3::msr("regr.rsq"), mlr3::msr("regr.mae"))
+model_mlr3$aggregate(measures = my_measures)
+
+print(learner$importance())
+print(learner$model)
+
+pred <- learner$predict(task)
+pred$score(msr("regr.rmse"))
+pred$score(msr("regr.rsq"))
+head(pred$response)  # predicted values
+```
+
+
+# Prediction
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+grid_predict <- midwest_grid
+predictors_only <- grid_predict %>%
+  st_drop_geometry() %>%
+  dplyr::select(allocated, RUCC_2023, mean_EJI, methane, pct_ag)
+predictions <- learner$predict_newdata(predictors_only)
+grid_predict$predicted_cafo <- predictions$response
+
+ggplot(grid_predict) +
+  geom_sf(aes(fill = predicted_cafo)) +
+  scale_fill_viridis_c(option = "C", name = "Predicted CAFO Count") +
+  theme_minimal() +
+  ggtitle("Predicted CAFO Count per Grid Cell")
+
+ggplot(midwest_grid) +
+  geom_sf(aes(fill = cafo_count)) +
+  scale_fill_viridis_c(option = "C", name = "Predicted CAFO Count") +
+  theme_minimal() +
+  ggtitle("CAFO Count per Grid Cell")
+
+test_prediction <- learner$predict(task, row_ids = train_test_split$test)
+test_prediction$score(my_measures)
+plot(test_prediction)
+
+#### minnesota
+grid_predict <- minnesota_grid
+predictors_only <- minnesota_grid3 %>%
+  st_drop_geometry() %>%
+  dplyr::select(allocated, mean_EJI, methane, var1.pred.x, ag_employment, allocated_pop_density)
+predictions <- learner$predict_newdata(predictors_only)
+minnesota_grid3$predicted_cafo <- predictions$response
+minnesota_grid3$residuals <- minnesota_grid3$predicted_cafo - minnesota_grid3$cafo_count
+
+g1 <- ggplot(minnesota_grid3) +
+  geom_sf(aes(fill = predicted_cafo)) +
+  scale_fill_viridis_c(option = "C", name = "Predicted CAFO Count") +
+  theme_minimal() +
+  ggtitle("Predicted CAFO Count per Grid Cell")
+
+g2 <- ggplot(minnesota_grid3) +
+  geom_sf(aes(fill = cafo_count)) +
+  scale_fill_viridis_c(option = "C", name = "CAFO Count") +
+  theme_minimal() +
+  ggtitle("CAFO Count per Grid Cell")
+
+grid.arrange(g1, g2, ncol=2)
+
+```
+# Area of Applicability
+```{r}
+resampling <- rsmp("spcv_block", folds = 5, rows = 10, cols = 10)
+rsmp_cv <- resampling$instantiate(task)
+
+inst_dt <- as.data.table(rsmp_cv$instance)
+inst_dt <- inst_dt[order(row_id)]  # order by row_id ascending
+CVtest <- inst_dt$fold
+length(CVtest) == nrow(task$data())
+all(inst_dt$row_id == seq_len(nrow(task$data())))
+
+length(rsmp_cv$instance[order(row_id)]$fold) == nrow(task$data())
+midwest_grid_clean <- midwest_grid |>
+  dplyr::select(all_of(features)) |>
+  na.omit()
+weights_vec <- learner$importance()
+weights_df <- data.frame(t(weights_vec))
+colnames(weights_df) <- names(weights_vec)
+AOA <- CAST::aoa(
+  newdata = as.data.frame(st_drop_geometry(midwest_grid)[, features]),
+  train = as.data.frame(task$data()),
+  variables = task$feature_names,
+  weight = weights_df,
+  CVtest = CVtest,
+  verbose = FALSE)
+
+plot(AOA$AOA, main = "Area of Applicability")
+
+
+rsmp_cv <- resampling$instantiate(task)
+
+# AoA calculation with CAST package
+AOA <- CAST::aoa(
+  newdata = predictors_only,
+  train = as.data.frame(task$data()),
+  variables = task$feature_names,
+  weight = data.frame(t(learner$importance())),
+  CVtest = resampling$instance[order(row_id)]$fold,
+  verbose = FALSE
+)
+ggplot(minnesota_grid) +
+  geom_sf(aes(fill = AOA$AOA)) +
+  scale_fill_viridis_c(option = "C", name = "AOA") +
+  theme_minimal() +
+  ggtitle("AOA")
+
+summary(AOA$AOA)
+plot(AOA$AOA, main = "Area of Applicability")
+
+importance_vec <- model$variable.importance
+importance_df <- as.data.frame(t(importance_vec))  # AOA wants 1-row data frame
+
+# 5. Run AOA
+AOA_result <- CAST::aoa(
+  newdata = as.data.frame(st_drop_geometry(predict_df)[, features]),
+  train = as.data.frame(st_drop_geometry(train_df)[, features]),
+  variables = features,
+  weight = importance_df
+)
+
+
+```
+
+# Semi-supervised
+```{r}
+set.seed(123)
+# labeled training data
+labeled <- midwest_grid %>% filter(has_data)
+
+# pos/neg sampling
+labeled$sampling_label <- ifelse(labeled$cafo_count > 0, 1, 0)
+
+# balance
+positive <- labeled[labeled$sampling_label == 1, ]
+negative <- labeled[labeled$sampling_label == 0, ]
+num_pos <- nrow(positive)
+negative_sample <- negative[sample(nrow(negative), num_pos), ]
+balanced_data <- rbind(positive, negative_sample)
+
+grid_centroids <- st_centroid(midwest_grid)
+cafo_cells <- midwest_grid %>% filter(cafo_count > 0)
+cafo_centroids <- st_centroid(cafo_cells)
+
+# 30 km distance -negative sampling
+non_cafo_cells <- midwest_grid %>% filter(cafo_count == 0)
+close_to_cafo <- st_is_within_distance(non_cafo_cells, cafo_centroids, dist = 30000)
+
+neg_near_cafo <- non_cafo_cells[lengths(close_to_cafo) > 0, ]
+
+balanced_data <- bind_rows(positive, neg_near_cafo)
+
+# unlabeled
+unlabeled <- midwest_grid %>% filter(!has_data)
+
+features <- c("allocated", "RUCC_2023", "methane", "ag_employment", "mean_EJI", "pop_density")
+
+labeled_df <- st_drop_geometry(balanced_data)[, c("cafo_count", features)]
+# task <- TaskRegr$new(id = "cafo_task", backend = labeled_df, target = "cafo_count")
+task <- mlr3spatiotempcv::as_task_regr_st(st_centroid(balanced_data[, c("cafo_count", features)]), target = "cafo_count")
+
+# spatial CV
+resampling <- mlr3::rsmp("spcv_block", folds = 5, cols = 10, rows = 10)
+resampling$instantiate(task)
+
+# train and validate model
+learner <- lrn("regr.ranger", importance = "permutation")
+learner$train(task) # train model
+rr <- resample(task, learner, resampling)
+rr$aggregate(measures = list(msr("regr.mae"), msr("regr.rmse"), msr("regr.rsq")))
+
+
+# predict on unlabeled
+unlabeled_df <- st_drop_geometry(unlabeled)[, features]
+predictions <- learner$predict_newdata(unlabeled_df)
+unlabeled$predicted_cafo <- predictions$response
+
+# predict on labeled
+pred_train <- learner$predict(task)
+labeled$predicted_cafo <- pred_train$response
+pred_train$score(msr("regr.mae"))
+pred_train$score(msr("regr.rmse"))
+pred_train$score(msr("regr.rsq"))
+
+learner$importance()
+
+combined <- bind_rows(labeled, unlabeled)
+
+ggplot(combined) +
+  geom_sf(aes(fill = coalesce(cafo_count, predicted_cafo))) +
+  scale_fill_viridis_c() +
+  labs(title = "Observed + Predicted CAFO Count per Grid Cell")
+ggplot(combined) +
+  geom_sf(aes(fill = predicted_cafo)) +
+  scale_fill_viridis_c() +
+  labs(title = "Predicted CAFO Count per Grid Cell")
+
+plot(pred_train)
+
+```
+
+# AOA
+```{r}
+
+AOA <- aoa(
+  newdata = st_drop_geometry(unlabeled)[, features],
+  train = st_drop_geometry(balanced_data)[, features],
+  variables = features
+)
+
+```
+
+
+
+# Full workflow
+
+## pos/neg sampling (distance-based)
+
+```{r}
+library(sf)
+library(dplyr)
+library(FNN) 
+library(mlr3verse)
+
+positive <- midwest_grid %>% filter(cafo_count > 0)
+negative_candidates <- midwest_grid %>% filter(cafo_count == 0)
+n_pos <- nrow(positive)
+negatives <- negative_candidates %>% slice_sample(n = round(0.5*n_pos))
+
+# positive_centroids <- st_centroid(positive)
+# negative_centroids <- st_centroid(negative_candidates)
+# 
+# # 30km distance - nearest neg cells
+# dist_matrix <- st_distance(negative_centroids, positive_centroids)
+# dist_km <- units::set_units(dist_matrix, "km")
+# within_range <- apply(dist_km, 1, function(x) any(x > 5 & x < 30))  # avoid 0-distance
+# 
+# negatives <- negative_candidates[within_range, ]
+
+# combine positive and negative
+labeled <- bind_rows(mutate(positive, label = 1), mutate(negatives, label = 0))
+
+# since cafo_count heavily right-skewed, let's try log-transformation
+plot(log(labeled$cafo_count))
+
+
+known_cafo_coords <- st_coordinates(st_centroid(positive))  # known CAFO locations
+all_coords <- st_coordinates(st_centroid(midwest_grid))
+
+# use FNN for fast nearest neighbor
+nn_idx <- get.knnx(data = known_cafo_coords, query = all_coords, k = 1)$nn.index
+nn_dist <- get.knnx(data = known_cafo_coords, query = all_coords, k = 1)$nn.dist
+
+midwest_grid$dist_to_cafo_km <- nn_dist[, 1] / 1000  # assuming CRS in meters
+
+
+```
+
+
+## Task and split data
+```{r}
+#features <- c("allocated", "RUCC_2023", "methane", "mean_EJI", "population", "canopy_cover", "dist_to_ag_cluster_km",  "dist_to_urban", "median_income", "num_cattle", "dist_to_facility", "developed_high")
+features2 <- c("cropland", "pastureland", "methane", "mean_EJI", "canopy_cover", "dist_to_facility",  "animal_count", "animal_N", "animal_P", "Other_P_kg-2017", "Other_N_kg-2017", "dist_to_urban")
+
+coords <- st_coordinates(st_centroid(labeled))
+labeled_df <- labeled %>%
+  st_drop_geometry() %>%
+  mutate(x = coords[, 1], y = coords[, 2]) %>%
+  dplyr::select(cafo_count, all_of(features2), x, y)
+
+labeled_df$log_cafo <- log1p(labeled_df$cafo_count)
+labeled$log_cafo <- log1p(labeled$cafo_count)
+
+labeled_df <- subset(labeled_df, select = -c(cafo_count))
+labeled_df$weight <- ifelse(labeled_df$log_cafo > 0 , 5, 1)
+labeled_df$dist_to_urban <- scale(labeled_df$dist_to_urban)
+
+write.csv(labeled_df, "labeled_data.csv", row.names = FALSE)
+
+task <- mlr3spatiotempcv::as_task_regr_st(labeled_df, target = "log_cafo", coordinate_names = c("x", "y"))
+task$set_col_roles("weight", roles = "weights_learner")
+
+# train/val/test split
+#set.seed(123)
+#split <- partition(task, ratio = 0.6)
+
+boxplot(labeled_df$dist_to_cafo_km, unlabeled_df$dist_to_cafo_km, names = c("Train", "Unlabeled"))
+```
+
+## spatial train/validation/test split
+```{r}
+set.seed(123)
+resampling <- rsmp("spcv_coords", folds = 10)
+resampling$instantiate(task)
+
+```
+
+
+## Training and Validation
+```{r}
+#set.seed(123)
+#train_idx <- sample(task$row_ids, 0.8*task$nrow)
+#test_idx <- setdiff(task$row_ids, train_idx)
+
+#learner <- lrn("regr.ranger", importance = "impurity")
+#learner$train(task, row_ids = train_ids)
+
+# xgboost with weighting
+learner <- lrn("regr.xgboost", nrounds = 200, max_depth = 4, eta = 0.01, subsample = 0.7, colsample_bytree = 0.7, lambda = 1, alpha = 0.5)
+
+library(mlr3tuning)
+library(mlr3learners)
+library(paradox)
+learner <- lrn("regr.xgboost", nrounds = 200)
+search_space <- ps(
+  nrounds    = p_int(lower = 100, upper = 1000),
+  eta        = p_dbl(lower = 0.01, upper = 0.3),
+  max_depth  = p_int(lower = 3, upper = 10),
+  subsample  = p_dbl(lower = 0.5, upper = 1),
+  colsample_bytree = p_dbl(lower = 0.5, upper = 1),
+  min_child_weight = p_dbl(lower = 1, upper = 10),
+  gamma      = p_dbl(lower = 0, upper = 10)
+)
+
+# tuner + resampling
+tuner = tnr("random_search")
+resampling = rsmp("spcv_coords", folds = 5)
+resampling$instantiate(task)
+
+instance = TuningInstanceSingleBatchCrit$new(
+  task = task,
+  learner = learner,
+  resampling = resampling,
+  measure = msr("regr.rmse"),
+  search_space = search_space,
+  terminator = trm("evals", n_evals = 50)
+)
+
+tuner$optimize(instance)
+
+# get best learner
+learner$param_set$values = instance$result_learner_param_vals
+
+
+
+rr <- resample(task, learner, resampling)
+rr$aggregate(msrs(c("regr.mae", "regr.rmse", "regr.rsq")))
+rr$score(msrs(c("regr.mae", "regr.rmse", "regr.rsq")))
+
+learner$train(task)
+print(learner$importance())
+
+# predict on labeled
+pred_train <- learner$predict(task)
+labeled$predicted_cafo <- round(expm1(pred_train$response))
+pred_train$score(msr("regr.mae"))
+pred_train$score(msr("regr.rmse"))
+pred_train$score(msr("regr.rsq"))
+plot(pred_train)
+
+```
+
+## Prediction on unlabeled
+```{r}
+unlabeled <- midwest_grid %>% filter(is.na(cafo_count)) 
+coords_unlabeled <- st_coordinates(st_centroid(unlabeled))
+
+unlabeled <- unlabeled %>% 
+  mutate(x = coords_unlabeled[, 1], y = coords_unlabeled[, 2]) %>%
+  dplyr::select(all_of(features), x, y) %>%
+  na.omit()
+
+unlabeled_df <- unlabeled %>% 
+  st_drop_geometry() %>%
+  dplyr::select(all_of(features), x, y) %>%
+  na.omit()
+
+write.csv(unlabeled_df, "unlabeled_data.csv", row.names = FALSE)
+
+preds_unlabeled <- learner$predict_newdata(newdata = unlabeled_df)
+unlabeled$predicted_cafo <- round(expm1(preds_unlabeled$response))
+unlabeled_df$log_cafo_pred <- preds_unlabeled$response
+
+hist(log1p(midwest_grid$cafo_count))
+hist(expm1(boot_data$log_cafo))
+
+
+hist(preds_unlabeled$response, breaks = 50)
+
+cor(labeled_df$methane, labeled_df$canopy_cover, use = "complete.obs")
+cor(labeled_df$dist_to_urban, labeled_df$log_cafo, use = "complete.obs")
+```
+## self-training?
+```{r}
+threshold_high <- quantile(unlabeled_df$log_cafo_pred, 0.95)
+threshold_low <- quantile(unlabeled_df$log_cafo_pred, 0.05)
+
+pseudo_labeled <- unlabeled_df %>%
+  filter(log_cafo_pred > threshold_high | log_cafo_pred < threshold_low) %>%
+  mutate(log_cafo = log_cafo_pred,
+         weight = ifelse(log_cafo_pred > 0, 1, 0.5)) # or another weighting rule
+
+
+labeled_df$source <- "labeled"
+pseudo_labeled$source <- "pseudo"
+combined_df <- bind_rows(labeled_df, pseudo_labeled)
+
+# Make task again
+task_combined <- as_task_regr_st(combined_df[, c(features, "x", "y", "log_cafo", "weight")], target = "log_cafo", coordinate_names = c("x", "y"))
+task_combined$set_col_roles("weight", roles = "weights_learner")
+
+# Retrain
+resampling$instantiate(task_combined)
+learner$train(task_combined)
+rr2 <- resample(task_combined, learner, resampling)
+rr2$aggregate(msrs(c("regr.mae", "regr.rmse", "regr.rsq")))
+rr2$score(msrs(c("regr.mae", "regr.rmse", "regr.rsq")))
+
+```
+
+
+## plot
+```{r}
+combined <- bind_rows(labeled, unlabeled)
+ggplot(combined) +
+  geom_sf(aes(fill = coalesce(cafo_count, predicted_cafo))) +
+  scale_fill_viridis_c() +
+  labs(title = "Observed + Predicted CAFO Count per Grid Cell")
+ggplot(combined) +
+  geom_sf(aes(fill = predicted_cafo)) +
+  scale_fill_viridis_c() +
+  labs(title = "Predicted CAFO Count per Grid Cell")
+
+```
+
+## propensity score matching
+```{r}
+library(MatchIt)
+labeled <- midwest_grid %>% filter(!(is.na(cafo_count)))
+labeled$label <- as.numeric(labeled$cafo_count > 0)
+labeled$allocated[is.na(labeled$allocated)] <- mean(labeled$allocated, na.rm=TRUE)
+
+m.out <- matchit(
+  label ~ allocated + population + mean_EJI + canopy_cover + RUCC_2023 + num_cattle + dist_to_facility,
+  data = labeled,
+  method = "nearest",
+  ratio = 1)
+
+matched_data <- match.data(m.out)
+negative_candidates <- matched_data %>% filter(matched_data$label == 0)
+negatives <- negative_candidates %>% slice_sample(n = round(0.2*n_pos))
+labeled <- bind_rows(mutate(positive, label = 1), mutate(negatives, label = 0))
+
+
+```
+
+
+#moran's I
+```{r}
+coords <- st_coordinates(st_centroid(labeled))
+neighbors <- knearneigh(coords, k = 5)
+nb <- knn2nb(neighbors)
+listw <- nb2listw(nb)
+preds <- rr$prediction
+residuals <- preds$truth - preds$response
+moran.test(residuals, listw)
+
+```
+
+
+# Minnesota
+```{r}
+minnesota_grid <- st_transform(minnesota_grid, 5070)
+mn_cafos <- st_transform(mn_cafos, 5070)
+
+minnesota_grid$cafo_count <- lengths(st_intersects(minnesota_grid, mn_cafos))
+
+positive <- minnesota_grid %>% filter(cafo_count > 0)
+negative_candidates <- minnesota_grid %>% filter(cafo_count == 0)
+positive_centroids <- st_centroid(positive)
+negative_centroids <- st_centroid(negative_candidates)
+
+# 30km distance - nearest neg cells
+dist_matrix <- st_distance(negative_centroids, positive_centroids)
+dist_km <- units::set_units(dist_matrix, "km")
+within_range <- apply(dist_km, 1, function(x) any(x > 5 & x < 30))  # avoid 0-distance
+
+negatives <- negative_candidates[within_range, ]
+
+# combine positive and negative
+labeled <- bind_rows(mutate(positive, label = 1), mutate(negatives, label = 0))
+
+# since cafo_count heavily right-skewed, let's try log-transformation
+plot(log(labeled$cafo_count))
+plot(labeled$cafo_count)
+
+```
+## Task and split data
+```{r}
+features <- c("allocated", "RUCC_2023", "methane", "ag_employment", "mean_EJI", "allocated_pop_density", "var1.pred.x")
+# labeled_df <- labeled %>%
+#  st_drop_geometry() %>%
+#  dplyr::select(label, all_of(features), cafo_count)
+#labeled_df$label <- as.factor(labeled_df$label)
+
+coords <- st_coordinates(st_centroid(labeled))
+labeled_df <- labeled %>%
+  st_drop_geometry() %>%
+  mutate(x = coords[, 1], y = coords[, 2]) %>%
+  dplyr::select(cafo_count, all_of(features), x, y)
+
+labeled_df$log_cafo <- log1p(labeled_df$cafo_count)
+labeled_df <- subset(labeled_df, select = -c(cafo_count))
+task <- mlr3spatiotempcv::as_task_regr_st(labeled_df, target = "log_cafo", coordinate_names = c("x", "y"))
+
+# train/val/test split
+#set.seed(123)
+#split <- partition(task, ratio = 0.6)
+
+
+```
+
+## spatial CV
+```{r}
+set.seed(123)
+resampling <- rsmp("spcv_coords", folds = 5)
+resampling$instantiate(task)
+
+```
+
+## Training and Validation
+```{r}
+
+learner <- lrn("regr.ranger", importance = "impurity")
+#learner$train(task, row_ids = train_ids)
+
+rr <- resample(task, learner, resampling)
+rr$aggregate(msrs(c("regr.mae", "regr.rmse", "regr.rsq")))
+rr$score(msrs(c("regr.mae", "regr.rmse", "regr.rsq")))
+
+learner$train(task)
+print(learner$importance())
+
+# predict on labeled
+pred_train <- learner$predict(task)
+labeled$predicted_cafo <- expm1(pred_train$response)
+pred_train$score(msr("regr.mae"))
+pred_train$score(msr("regr.rmse"))
+pred_train$score(msr("regr.rsq"))
+
+
+```
+
+## Prediction on unlabeled
+```{r}
+unlabeled <- midwest_grid %>% filter(is.na(cafo_count))
+coords_unlabeled <- st_coordinates(st_centroid(unlabeled))
+unlabeled_df <- unlabeled %>%
+  st_drop_geometry() %>%
+  mutate(x = coords_unlabeled[, 1], y = coords_unlabeled[, 2]) %>%
+  dplyr::select(all_of(features), x, y)
+
+preds_unlabeled <- learner$predict_newdata(newdata = unlabeled_df)
+unlabeled$predicted_cafo <-round(preds_unlabeled$response)
+
+
+```
+
+

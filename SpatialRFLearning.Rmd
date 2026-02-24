@@ -1,0 +1,337 @@
+---
+title: "SpatialRFLearning"
+author: "Nidhi Ram"
+date: "2025-07-14"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(GWmodel)      ## GW models
+library(plyr)         ## Data management
+library(sp)           ## Spatial Data management
+library(spdep)        ## Spatial autocorrelation
+library(RColorBrewer) ## Visualization
+library(classInt)     ## Class intervals
+library(raster)       ## spatial data
+library(grid)         ## plot
+library(gridExtra)    ## Multiple plot
+library(ggplot2)      #  plotting
+library(tidyverse)    # data 
+library(SpatialML)    # Geographically weigted regression
+
+```
+
+# Load data
+```{r}
+# Define data folder
+dataFolder <- "~/Downloads/Data_GWR/Data_GWR 2/"
+
+county <- shapefile(paste0(dataFolder,"COUNTY_ATLANTIC.shp"))
+state.bd <- shapefile(paste0(dataFolder, "STATE_ATLANTIC.shp"))
+df <- read.csv(paste0(dataFolder, "data_all_1998_2012.csv"), header=T)
+state <- list("sp.lines", as(state.bd, "SpatialLines"), col="grey50", lwd=.7,lty=3) 
+```
+
+# Create training, validation, and test data
+```{r}
+test.df <- df %>% 
+  dplyr::select(FIPS, x, y, Year, POVERTY, SMOKING, PM25, NO2, SO2, Rate) %>%
+  filter(Year == 2012)
+
+valid.df <- df %>% 
+  dplyr::select(FIPS, x, y, Year, POVERTY, SMOKING, PM25, NO2, SO2, Rate) %>%
+  filter(Year == 2011)
+
+train.df <- df %>% 
+  dplyr::select(FIPS, x, y,  Year, POVERTY, SMOKING, PM25, NO2, SO2, Rate) %>%
+  filter(Year == 2010)
+
+```
+
+# Scale covariates
+```{r}
+test.df[, 5:9] = scale(test.df[, 5:9])
+valid.df[, 5:9] = scale(valid.df[, 5:9])
+train.df[, 5:9] = scale(train.df[, 5:9])
+
+
+```
+
+GLOBAL RANDOM FOREST - DRF
+
+# (RGS) Grid search for hyperparameters
+
+## Connect to H2O
+```{r}
+library(h2o)
+h2o.init(nthreads = -1, max_mem_size = "48g", enable_assertions = FALSE)
+
+```
+
+## Create h2o dataframes
+```{r}
+test.mf <- test.df[, 5:10]
+valid.mf <- valid.df[, 5:10]
+train.mf <- train.df[, 5:10]
+
+test.hex <- as.h2o(test.mf)
+valid.hex <- as.h2o(valid.mf)
+train.hex <- as.h2o(train.mf)
+
+```
+
+## Define response and predictors
+```{r}
+response <- "Rate"
+predictors <- setdiff(names(train.hex), response)
+
+```
+
+```{r}
+# Hyper-parameter
+drf_hyper_params <- list(
+              ntrees  = seq(10, 5000, by = 10),
+              max_depth=c(10,20,30,40,50),
+              sample_rate=c(0.7, 0.8, 0.9, 1.0))
+
+#  serach criteria
+drf_search_criteria <- list(strategy = "RandomDiscrete", 
+                        max_models = 200,
+                        max_runtime_secs = 900,
+                        stopping_tolerance = 0.001,
+                        stopping_rounds = 2,
+                        seed = 123)
+# Grid Search
+drf_grid <- h2o.grid(
+                  algorithm="randomForest",
+                  grid_id = "drf_grid_IDx",
+                  x= predictors,
+                  y = response,
+                  training_frame = train.hex,
+                  validation_frame = valid.hex,
+                  stopping_metric = "RMSE",
+                  nfolds=10,
+                  keep_cross_validation_predictions = TRUE,
+                  hyper_params = drf_hyper_params,
+                  search_criteria = drf_search_criteria,
+                  seed = 123)
+
+
+
+```
+
+# DRF Grid parameters
+```{r}
+# RF Grid parameters
+drf_get_grid <- h2o.getGrid("drf_grid_IDx", sort_by="RMSE", decreasing=FALSE)
+drf_get_grid@summary_table[1,]
+
+```
+
+# The Best DRF Model
+```{r}
+best_drf <- h2o.getModel(drf_get_grid@model_ids[[1]])
+best_drf
+```
+# Prediction
+```{r}
+# Create a data frame
+FIPS.xy <- test.df[,1:3]
+FIPS.xy$obs_2011 <- valid.df[,10]
+FIPS.xy$obs_2012 <- test.df[,10]
+
+# validation data
+pred.valid <- as.data.frame(h2o.predict(object = best_drf, newdata = valid.hex))
+```
+
+```{r}
+FIPS.xy$RF_2011 <- pred.valid$predict
+
+#test data
+pred.test <- as.data.frame(h2o.predict(object = best_drf, newdata = test.hex))
+
+```
+
+```{r}
+FIPS.xy$RF_2012 <- pred.test$predict
+
+cat('RF Validation RMSE:', round(sqrt(mean((FIPS.xy$RF_2011-FIPS.xy$obs_2011)^2 , na.rm = TRUE)), digits=3), '\n')
+cat('RF Validation MAE:', round(mean(abs(FIPS.xy$RF_2011-FIPS.xy$obs_2011) , na.rm = TRUE ), digits=3), '\n')
+cat('RF Validation R2:', round(summary(lm(obs_2011~RF_2011,FIPS.xy))$r.squared, digits=3), '\n')
+cat('RF Test RMSE:', round(sqrt(mean((FIPS.xy$RF_2012-FIPS.xy$obs_2012)^2 , na.rm = TRUE)), digits=3), '\n')
+cat('RF Test MAE:', round(mean(abs(FIPS.xy$RF_2012-FIPS.xy$obs_2012) , na.rm = TRUE ), digits=3), '\n')
+cat('RF Test R2:', round(summary(lm(obs_2012~RF_2012,FIPS.xy))$r.squared, digits=3), '\n')
+
+```
+
+# RF Predicted 1:1 Plot
+
+## Validation Data
+```{r}
+p.valid<-ggplot(data=FIPS.xy, aes(x=obs_2011, y=RF_2011))+ 
+  geom_point(size = 1.0)+
+  geom_smooth(method = "lm", se = FALSE, colour="black",size=0.5)+
+  scale_x_continuous(limits=c(20,120), breaks=seq(20, 120, 20))+ 
+  scale_y_continuous(limits=c(20,120), breaks=seq(20, 120, 20)) +
+  theme_light() +
+  ggtitle("Validation data: 2011")+
+  theme(
+    plot.title = element_text(color="black", size=12,hjust = 0.5),
+    panel.background = element_rect(fill = "white",colour = "gray75",size = 0.5, linetype = "solid"),
+    axis.line = element_line(colour = "grey"),
+    panel.grid.major = element_blank(),
+    axis.text.x=element_text(size=10, colour="black"),
+    axis.text.y=element_text(size=10,angle = 90,vjust = 0.5, hjust=0.5, colour='black'))+
+  geom_abline(slope=1, intercept=0,linetype="dashed",size=0.5)+
+  labs(x="Observed", y = "Predicted") 
+
+```
+## Test Data
+```{r}
+p.test <- ggplot(data=FIPS.xy, aes(x=obs_2012, y=RF_2012))+ 
+  geom_point(size = 1.0)+
+  geom_smooth(method = "lm", se = FALSE, colour="black",size=0.5)+
+  scale_x_continuous(limits=c(20,120), breaks=seq(20, 120, 20))+ 
+  scale_y_continuous(limits=c(20,120), breaks=seq(20, 120, 20)) +
+  theme_light() +
+  ggtitle("Test data - 2012")+
+  theme(
+    plot.title = element_text(color="black", size=12,hjust = 0.5),
+    panel.background = element_rect(fill = "white",colour = "gray75",size = 0.5, linetype = "solid"),
+    axis.line = element_line(colour = "grey"),
+    panel.grid.major = element_blank(),
+    axis.text.x=element_text(size=10, colour="black"),
+    axis.text.y=element_text(size=10,angle = 90,vjust = 0.5, hjust=0.5, colour='black'))+
+  geom_abline(slope=1, intercept=0,linetype="dashed",size=0.5)+
+  labs(x="Observed", y = "Predicted") 
+
+
+```
+
+## Plot all
+```{r}
+grid.arrange(p.valid,p.test, 
+            ncol= 2, 
+            heights = c(30,6), 
+            top = textGrob("Random Forest Predicted LBC Mortality Rate 
+                          \n(death per 100,000)",gp=gpar(fontsize=18)))
+
+```
+
+
+## Map predicted values
+```{r, fig.align="center", echo = FALSE, fig.width = 14}
+rf.SPDF<-merge(county, FIPS.xy, by="FIPS")
+names(rf.SPDF)
+
+myPalette <- colorRampPalette(c("blue","green", "yellow", "red", "red4"))
+
+spplot(rf.SPDF, 
+        c("RF_2011", "RF_2012", "obs_2011", "obs_2012" ),         
+         layout=c(2, 2),
+         par.strip.text=list(cex=1, lines=1, col="black"),
+         main = list( "Random Forest Predicted LBC Mortality Rate 
+                 \n(death per 100,000)", adj = 0.5),
+         sp.layout=list(state),
+         par.settings=list(strip.background=list(col="transparent"),
+                             strip.border = list(col = 'grey95',lwd=0.5),
+                             axis.line=list(col="grey95",lwd=0.5)),
+         col="transparent",
+         colorkey=list(space="right",height=1, width=2,labels=list(cex=1.75)),
+         col.regions=myPalette(100))
+
+```
+
+# Interpretable Machine Learning
+```{r}
+library(pdp)
+library(vip)
+
+
+features <- as.data.frame(train.hex) %>%  dplyr::select(-Rate)
+
+# 2) Create a vector with the actual responses
+response <- as.data.frame(train.hex) %>% pull(Rate)
+
+# 3) Create custom predict function that returns the predicted values as a vector
+pred <- function(object, newdata)  {
+  results <- as.vector(h2o.predict(object, as.h2o(newdata)))
+  return(results)
+  }
+
+```
+
+
+# Permutation-based feature imporance
+
+
+--------------------------------------------------------------------------------
+
+# LOCAL RANDOM FOREST
+```{r}
+library(SpatialML)
+
+Coords <- train.df[ , 2:3]
+grf.model <- grf(Rate ~ POVERTY+SMOKING+PM25+NO2+SO2, dframe=train.df, bw=162, ntree=500, mtry = 2, kernel = "adaptive", forests = TRUE, coords = Coords)
+
+grf.model$Global.Model$importance 
+grf.model$Global.Model$variable.importance
+mean(grf.model$Global.Model$rsq)
+grf.model$LocalModelSummary
+
+```
+## Local Feature Importance
+```{r}
+gwrf.SPDF<-shapefile(paste0(dataFolder,"COUNTY_ATLANTIC.shp"))
+gwrf.SPDF@data$incMSE.SMOK=grf.model$Local.Pc.IncMSE$SMOK
+gwrf.SPDF@data$incMSE.POV=grf.model$Local.Pc.IncMSE$POV
+gwrf.SPDF@data$incMSE.PM25=grf.model$Local.Pc.IncMSE$PM25
+gwrf.SPDF@data$incMSE.NO2=grf.model$Local.Pc.IncMSE$NO2
+gwrf.SPDF@data$incMSE.SO2=grf.model$Local.Pc.IncMSE$SO2
+
+```
+
+
+## Plot local feature importance
+```{r}
+col.palette.t<-colorRampPalette(c("blue",  "sky blue", "green","yellow","pink", "red"),space="rgb",interpolate = "linear") 
+
+smok<-spplot(gwrf.SPDF,"incMSE.SMOK", main = "Smoking", 
+       sp.layout=list(state),
+       col="transparent",
+       col.regions=rev(col.palette.t(100)))
+
+pov<-spplot(gwrf.SPDF,"incMSE.POV", main = "Poverty", 
+       sp.layout=list(state),
+       col="transparent",
+       col.regions=rev(col.palette.t(100)))
+
+pm25<-spplot(gwrf.SPDF,"incMSE.PM25", main = "PM25", 
+       sp.layout=list(state),
+       col="transparent",
+       col.regions=rev(col.palette.t(100)))
+
+no2<-spplot(gwrf.SPDF,"incMSE.NO2", main = "NO2", 
+      sp.layout=list(state),
+      col="transparent",
+      col.regions=rev(col.palette.t(100)))
+
+so2<-spplot(gwrf.SPDF,"incMSE.NO2", main = "SO2", 
+      sp.layout=list(state),
+      col="transparent",
+      col.regions=rev(col.palette.t(100)))
+
+grid.arrange(smok, pov, pm25, no2, so2,
+             ncol=5, 
+             heights = c(30,6), 
+             top = textGrob("Local Feature Importance (IncMSE)",gp=gpar(fontsize=25)))
+
+
+```
+
+
+
+
+

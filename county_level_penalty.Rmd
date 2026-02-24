@@ -1,0 +1,1454 @@
+---
+title: "County_level_penalty"
+author: "Nidhi Ram"
+date: "2025-09-25"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# merge state and county-level totals
+```{r}
+epa_cafo_density <- epa_cafo_density %>% rename(epa_totals = number)
+us_grid <- us_grid %>%
+  left_join(epa_cafo_density, by = "FIPS")
+us_grid <- us_grid %>%
+  left_join(state_totals, by = c("STATE_N" = "State"))
+
+train_df <- labeled_df
+train_sf <- labeled
+train_df$epa_totals[is.na(train_df$epa_totals)] <- NA_real_
+train_sf$epa_totals[is.na(train_sf$epa_totals)] <- NA_real_
+
+```
+
+# county index 
+```{r}
+# counties that have epa data will be included in penalty (others get no penalty)
+county_levels <- unique(train_df$FIPS)
+# create mapping FIPS -> integer
+county_map <- data.frame(FIPS = unique(train_df$FIPS), county_id = seq_along(unique(train_df$FIPS)), stringsAsFactors = FALSE)
+train_df <- train_df %>% left_join(county_map, by = "FIPS")
+
+# note whether county has epa data
+train_df$county_penalty_id <- ifelse( !is.na(train_df$epa_totals), train_df$county_id, 0L)
+
+# epa total by county id
+C <- max(train_df$county_id, na.rm = TRUE)
+old_by_id <- rep(NA_real_, C)
+
+# get unique epa totals per county_id (if multiple rows per county, they should agree)
+old_vals <- train_df %>%
+  filter(!is.na(epa_totals)) %>%
+  group_by(county_id) %>%
+  summarise(epa_totals = first(epa_totals))
+old_by_id[old_vals$county_id] <- old_vals$epa_totals
+
+
+```
+
+# features
+```{r}
+features <- c("cropland", "pastureland", "RUCC_2023", "methane", "mean_EJI", "population", "canopy_cover", "dist_to_ag_cluster_km", "dist_to_facility", "phosphorus", "Black", "Hispanic", "animal_count", "animal_N", "animal_P", "Other_P_kg_2017", "Other_N_kg_2017", "median_income", "dist_to_urban", "female_ag_employment", "male_ag_employment","epa_totals", "Total_CAFOs", "crop_density", "ag_intensity", "rural_income", "x", "y")
+
+
+
+```
+
+# prepare for model
+```{r}
+X_mat_all <- train_df %>%
+  dplyr::select(all_of(features), x, y) %>%
+  mutate(across(everything(), ~ as.numeric(.)))
+
+# drop NA rows
+Xmat_complete <- as.matrix(X_mat_all[complete.cases(X_mat_all), , drop = FALSE])
+y_complete <- as.numeric(train_df$log_cafo[complete.cases(X_mat_all)])
+county_penalty_id_complete <- train_df$county_penalty_id[complete.cases(X_mat_all)] 
+orig_row_ids <- which(complete.cases(X_mat_all))
+n_total <- nrow(Xmat_complete)
+cat("Rows used (complete cases):", n_total, "\n")
+if (exists("train_sf")) {
+  train_sf_complete <- train_sf[complete.cases(X_mat_all), ]
+} else {
+  # construct from coordinates in Xmat_complete / train_df
+  train_sf_complete <- st_as_sf(train_df[complete.cases(X_mat_all), ], coords = c("x", "y"), crs = st_crs(train_sf))
+}
+
+```
+
+# state penalty
+```{r}
+state_map <- data.frame(
+  STATE_N = unique(train_df$STATE_N),
+  state_id = seq_along(unique(train_df$STATE_N)),
+  stringsAsFactors = FALSE)
+
+train_df <- train_df %>%
+  left_join(state_map, by = "STATE_N")
+
+# mark states with reliable totals
+train_df$state_penalty_id <- ifelse(train_df$STATE_N %in% state_totals$State,
+                                    train_df$state_id, 0L)
+
+# state totals by id
+S <- max(train_df$state_id, na.rm = TRUE)
+state_by_id <- rep(NA_real_, S)
+
+tmpst <- train_df %>%
+  filter(STATE_N %in% state_totals$State) %>%
+  left_join(state_totals, by = c("STATE_N" = "State")) %>%
+  group_by(state_id) %>%
+  summarise(state_total = first(Total_CAFOs.x))
+
+state_by_id[tmpst$state_id] <- tmpst$state_total
+
+# vector for complete cases
+state_penalty_id_complete <- train_df$state_penalty_id[complete.cases(X_mat_all)]
+global_row2state <- state_penalty_id_complete
+
+```
+
+
+
+# spatial autocorrelation
+```{r}
+library(blockCV)
+autocorr <- cv_spatial_autocor(x = train_sf_complete, column = "log_cafo", plot=TRUE, progress=TRUE, num_sample = 6000)
+
+set.seed(123)
+spatial_blocks <- blockCV::cv_spatial(
+  x = train_sf_complete,
+  k = 5,
+  size = 140000,
+  selection = "systematic",
+  hexagon = FALSE,
+  progress = FALSE)
+
+folds_list <- spatial_blocks$folds_list
+n_folds <- length(folds_list)
+
+C <- length(old_by_id)
+global_row2county <- county_penalty_id_complete  
+
+```
+
+# spatial CV loop 
+```{r}
+results <- data.frame(fold = integer(0), R2 = numeric(0), RMSE = numeric(0), Pearson = numeric(0), MAE=numeric(0))
+oof_preds <- numeric(n_total)   # store out-of-fold predictions (un-calibrated)
+oof_preds_cal <- numeric(n_total) # store out-of-fold calibrated preds
+pred_matrix <- matrix(NA, nrow = nrow(Xmat_complete), ncol = n_folds)
+
+params <- list(
+  max_depth = 4,
+  eta = 0.03,
+  subsample = 0.8,
+  colsample_bytree = 0.6)
+
+lambda <- 1e-4   # county -- weak
+
+for (fold_i in seq_len(n_folds)) {
+  cat("Fold", fold_i, "starting...\n")
+  train_idx_local <- folds_list[[fold_i]][[1]]   # these are indices relative to train_sf_complete (1..n_total)
+  test_idx_local  <- folds_list[[fold_i]][[2]]
+  
+  # Build row2county for THIS fold (length = nrow(train_fold))
+  row2county_fold_full <- global_row2county[train_idx_local]
+  
+  # and row2state
+  row2state_fold <- global_row2state[train_idx_local]
+  
+  # split into list of rows per county id (only train rows)
+  county_rows_list_fold <- split(seq_along(row2county_fold_full), row2county_fold_full)
+  if ("0" %in% names(county_rows_list_fold)) county_rows_list_fold[["0"]] <- NULL
+  
+  # Make a small helper to vectorize rowsum mapping for the fold 
+  # extract the county ids active in this fold:
+  county_ids_fold <- as.integer(names(county_rows_list_fold))
+  
+  # If there are no counties with old_by_id in this fold, penalty will be inert
+  # But still build the objective to check NA safely.
+  
+  # Prepare DMatrix for train fold
+  X_train <- Xmat_complete[train_idx_local, , drop = FALSE]
+  y_train <- y_complete[train_idx_local]
+  dtrain_fold <- xgb.DMatrix(data = X_train, label = y_train)
+  
+  # Prepare DMatrix for test fold
+  X_test <- Xmat_complete[test_idx_local, , drop = FALSE]
+  y_test <- y_complete[test_idx_local]
+  dtest_fold <- xgb.DMatrix(data = X_test, label = y_test)
+  
+  # ---- Build fold-specific custom objective (vectorized) ----
+  # closure captures: row2county_fold_full, county_rows_list_fold, old_by_id, lambda
+  custom_obj_fold <- function(preds, dtrain) {
+    labels <- getinfo(dtrain, "label")
+    n <- length(preds)
+    grad <- preds - labels
+    hess <- rep(1.0, n)
+    
+    if (length(row2county_fold_full) != n) {
+      # safety check (should not happen)
+      stop("Mismatch: preds length != row2county_fold length")
+    }
+    
+    valid_rows <- which(row2county_fold_full > 0)
+    if (length(valid_rows) == 0L) {
+      return(list(grad = grad, hess = hess))
+    }
+    
+    # rowsum of preds by county id (only for valid rows)
+    pred_sums <- rowsum(preds[valid_rows], group = row2county_fold_full[valid_rows])
+    # pred_sums rownames are county ids as characters
+    cid <- as.integer(rownames(pred_sums))
+    old_vals <- old_by_id[cid]
+    
+    # compute county residuals (vector aligned with cid)
+    resid_sums <- pred_sums[,1] - old_vals
+    
+    # broadcast penalty grad back to row-level via indexing by row2county_fold_full
+    # resid_sums is named by county id; resid_sums[row2county_fold_full] will produce NA for rows with county id not in cid
+    # create penalty_grad vector length n
+    penalty_grad <- rep(0.0, n)
+    # only fill for rows in valid_rows
+    penalty_grad[valid_rows] <- 2.0 * lambda * resid_sums[as.character(row2county_fold_full[valid_rows])]
+    
+    # penalty hess: add 2*lambda for rows where county > 0 and old_val is not NA
+    penalty_hess <- rep(0.0, n)
+    # which valid rows have an old_val available?
+    # compute a logical mask per valid row: old_by_id[row2county_fold_full[row]] is not NA
+    has_old <- !is.na(old_by_id[row2county_fold_full[valid_rows]])
+    penalty_hess[valid_rows[has_old]] <- 2.0 * lambda
+    
+    grad <- grad + penalty_grad
+    hess <- hess + penalty_hess
+    return(list(grad = grad, hess = hess))
+  }
+  
+  # ---- Fold-specific correlation metric (for logging) ----
+  corr_metric_fold <- function(preds, dtrain) {
+    labels <- getinfo(dtrain, "label")
+    # compute pred_sums and label_sums by county for the fold (use row2county_fold_full mapping)
+    pred_sums <- tapply(preds, row2county_fold_full, sum)
+    label_sums <- tapply(labels, row2county_fold_full, sum)
+    if ("0" %in% names(pred_sums)) {
+      pred_sums <- pred_sums[names(pred_sums) != "0"]
+      label_sums <- label_sums[names(label_sums) != "0"]
+    }
+    common <- intersect(names(pred_sums), names(label_sums))
+    if (length(common) <= 1) {
+      return(list(metric = "county_pearson", value = 0))
+    }
+    ps <- as.numeric(pred_sums[common])
+    ls <- as.numeric(label_sums[common])
+    if (var(ps) == 0 || var(ls) == 0) {
+      return(list(metric = "county_pearson", value = 0))
+    }
+    return(list(metric = "county_pearson", value = cor(ps, ls)))
+  }
+  
+  # ---- Train with fold-specific objective ----
+  bst <- xgb.train(
+    params = params,
+    data = dtrain_fold,
+    nrounds = 400,
+    obj = custom_obj_fold,
+    feval = corr_metric_fold,
+    maximize = TRUE,
+    verbose = 0
+  )
+  
+  # ---- Predict train fold (for calibration) and test fold ----
+  preds_train_fold <- predict(bst, dtrain_fold)
+  preds_test_fold  <- predict(bst, dtest_fold)
+  pred_matrix[test_idx_local, fold_i] <- preds_test_fold
+  
+  # Fit polynomial calibration
+  df_cal <- data.frame(preds_train_fold = preds_train_fold, y = y_train)
+  fit_cal <- lm(y ~ poly(preds_train_fold, 2, raw = TRUE), data = df_cal)
+  
+  # Apply calibration to test fold predictions
+  preds_test_cal <- predict(fit_cal, newdata = data.frame(preds_train_fold = preds_test_fold))
+  preds_test_cal <- pmax(0, preds_test_cal)  # enforce non-negativity if desired
+  
+  # Store OOF preds (raw and calibrated) in global vectors (indexed by positions in Xmat_complete)
+  oof_preds[test_idx_local] <- preds_test_fold
+  oof_preds_cal[test_idx_local] <- preds_test_cal
+      
+  
+  # Compute fold metrics (on calibrated predictions)
+  fold_R2   <- 1 - sum((y_test - preds_test_cal)^2) / sum((y_test - mean(y_test))^2)
+  fold_RMSE <- sqrt(mean((y_test - preds_test_cal)^2))
+  fold_cor  <- cor(y_test, preds_test_cal, use = "complete.obs")
+  fold_MAE <- mean(abs(y_test - preds_test_cal))
+  
+  results <- rbind(results, data.frame(fold = fold_i, R2 = fold_R2, RMSE = fold_RMSE, Pearson = fold_cor, MAE = fold_MAE))
+  
+  cat(sprintf("Fold %d: R2=%.3f, RMSE=%.3f, Pearson=%.3f\n, MAE=%.3f", fold_i, fold_R2, fold_RMSE, fold_cor, fold_MAE))
+}
+
+print(results)
+cat("Mean OOS R2:", round(mean(results$R2, na.rm = TRUE), 5), "\n")
+cat("Mean OOS MAE:", round(mean(results$MAE, na.rm = TRUE), 5), "\n")
+cat("Mean OOS Pearson:", round(mean(results$Pearson, na.rm = TRUE), 5), "\n")
+cat("Mean OOS RMSE:", round(mean(results$RMSE, na.rm = TRUE), 5), "\n")
+
+pred_df <- data.frame(
+  fold = rep(seq_len(n_folds), times = sapply(folds_list, function(x) length(x[[2]]))),
+  true = y_complete,                   # true values
+  pred_raw = oof_preds,                # uncalibrated out-of-fold preds
+  pred_cal = oof_preds_cal,            # calibrated out-of-fold preds
+  county_id = global_row2county,       # county index (if available)
+  x = X_mat_all$x[complete.cases(X_mat_all)],
+  y = X_mat_all$y[complete.cases(X_mat_all)]
+)
+
+```
+
+# penalty strength
+```{r}
+
+lambda = 0.01 # small --need to tune this
+
+# Precompute county indices unique set for speed inside objective
+# map rows to county index 1..C (0 means no penalty)
+row2county <- as.integer(county_penalty_id_complete)  # integer vector length nrow(Xmat_complete)
+# Build list of indices per county for faster sum (optional)
+county_rows_list <- split(seq_along(row2county), row2county)
+# remove entry "0" (no penalty)
+if ("0" %in% names(county_rows_list)) county_rows_list[["0"]] <- NULL
+# convert names to integer indices
+county_ids_with_data <- as.integer(names(county_rows_list))
+
+# old_by_id vector is length C (some entries NA)
+# For county ids with old data, extract old totals vector indexed to county ids present in penalty list
+old_by_id_vec <- old_by_id  # length C, NA where none
+
+
+
+```
+
+
+# custom obj with state penalty
+```{r}
+results <- data.frame(fold = integer(0), R2 = numeric(0), RMSE = numeric(0),
+                      Pearson = numeric(0), MAE = numeric(0))
+
+oof_preds <- numeric(n_total)
+oof_preds_cal <- numeric(n_total)
+pred_matrix <- matrix(NA, nrow = nrow(Xmat_complete), ncol = n_folds)
+
+params <- list(
+  max_depth = 4,
+  eta = 0.03,
+  subsample = 0.8,
+  colsample_bytree = 0.6
+)
+
+lambda <- 0      # county penalty
+lambda_state <- 0   # state penalty 
+
+for (fold_i in seq_len(n_folds)) {
+  cat("Fold", fold_i, "starting...\n")
+
+  train_idx_local <- folds_list[[fold_i]][[1]]
+  test_idx_local  <- folds_list[[fold_i]][[2]]
+
+  row2county_fold_full <- global_row2county[train_idx_local]
+  row2state_fold_full  <- global_row2state[train_idx_local]
+
+  # Prepare DMatrix
+  X_train <- Xmat_complete[train_idx_local, , drop = FALSE]
+  y_train <- y_complete[train_idx_local]
+  dtrain_fold <- xgb.DMatrix(data = X_train, label = y_train)
+
+  X_test <- Xmat_complete[test_idx_local, , drop = FALSE]
+  y_test <- y_complete[test_idx_local]
+  dtest_fold <- xgb.DMatrix(data = X_test, label = y_test)
+
+  # ============================================================
+  # === CUSTOM OBJECTIVE: COUNTY + STATE PENALTIES =============
+  # ============================================================
+  custom_obj_fold <- function(preds, dtrain) {
+
+    labels <- getinfo(dtrain, "label")
+    n <- length(preds)
+
+    grad <- preds - labels
+    hess <- rep(1.0, n)
+
+    ### ---------------- COUNTY PENALTY ---------------- ###
+    valid_rows_cnty <- which(row2county_fold_full > 0)
+
+    if (length(valid_rows_cnty) > 0) {
+
+      cnty_pred_sums <- rowsum(preds[valid_rows_cnty],
+                               group = row2county_fold_full[valid_rows_cnty])
+
+      cid <- as.integer(rownames(cnty_pred_sums))
+      old_vals_cnty <- old_by_id[cid]
+
+      cnty_resid <- cnty_pred_sums[,1] - old_vals_cnty
+
+      penalty_grad_cnty <- rep(0, n)
+      penalty_grad_cnty[valid_rows_cnty] <-
+        2 * lambda * cnty_resid[as.character(row2county_fold_full[valid_rows_cnty])]
+
+      has_old_cnty <- !is.na(old_by_id[row2county_fold_full[valid_rows_cnty]])
+      penalty_hess_cnty <- rep(0, n)
+      penalty_hess_cnty[valid_rows_cnty[has_old_cnty]] <- 2 * lambda
+
+      grad <- grad + penalty_grad_cnty
+      hess <- hess + penalty_hess_cnty
+    }
+
+    ### ---------------- STATE PENALTY ADDED ---------------- ###
+    valid_rows_state <- which(row2state_fold_full > 0)
+
+    if (length(valid_rows_state) > 0) {
+
+      state_pred_sums <- rowsum(preds[valid_rows_state],
+                                group = row2state_fold_full[valid_rows_state])
+
+      sid <- as.integer(rownames(state_pred_sums))
+      old_vals_state <- state_by_id[sid]   # required minimum per state
+
+      state_resid <- state_pred_sums[,1] - old_vals_state
+
+      # gradient
+      penalty_grad_state <- rep(0, n)
+      penalty_grad_state[valid_rows_state] <-
+        2 * lambda_state * state_resid[as.character(row2state_fold_full[valid_rows_state])]
+
+      # hessian
+      has_old_state <- !is.na(state_by_id[row2state_fold_full[valid_rows_state]])
+      penalty_hess_state <- rep(0, n)
+      penalty_hess_state[valid_rows_state[has_old_state]] <- 2 * lambda_state
+
+      grad <- grad + penalty_grad_state
+      hess <- hess + penalty_hess_state
+    }
+
+    return(list(grad = grad, hess = hess))
+  }
+
+  # ======================= METRIC ======================
+  corr_metric_fold <- function(preds, dtrain) {
+    labels <- getinfo(dtrain, "label")
+    pred_sums <- tapply(preds, row2county_fold_full, sum)
+    label_sums <- tapply(labels, row2county_fold_full, sum)
+
+    if ("0" %in% names(pred_sums))
+      pred_sums <- pred_sums[names(pred_sums) != "0"]
+    if ("0" %in% names(label_sums))
+      label_sums <- label_sums[names(label_sums) != "0"]
+
+    common <- intersect(names(pred_sums), names(label_sums))
+    if (length(common) <= 1)
+      return(list(metric = "county_pearson", value = 0))
+
+    ps <- as.numeric(pred_sums[common])
+    ls <- as.numeric(label_sums[common])
+    if (var(ps) == 0 || var(ls) == 0)
+      return(list(metric = "county_pearson", value = 0))
+
+    return(list(metric = "county_pearson", value = cor(ps, ls)))
+  }
+
+  # ======================= TRAIN ======================
+  bst <- xgb.train(
+    params = params,
+    data = dtrain_fold,
+    nrounds = 400,
+    obj = custom_obj_fold,
+    feval = corr_metric_fold,
+    maximize = TRUE,
+    verbose = 0
+  )
+
+  # ======================= PREDICT + CALIBRATE ======================
+  preds_train_fold <- predict(bst, dtrain_fold)
+  preds_test_fold  <- predict(bst, dtest_fold)
+  pred_matrix[test_idx_local, fold_i] <- preds_test_fold
+
+  fit_cal <- lm(y ~ poly(preds_train_fold, 2, raw = TRUE),
+                data = data.frame(preds_train_fold, y = y_train))
+
+  preds_test_cal <- predict(fit_cal, newdata = data.frame(preds_train_fold = preds_test_fold))
+  preds_test_cal <- pmax(0, preds_test_cal)
+
+  oof_preds[test_idx_local] <- preds_test_fold
+  oof_preds_cal[test_idx_local] <- preds_test_cal
+
+  fold_R2   <- 1 - sum((y_test - preds_test_cal)^2) / sum((y_test - mean(y_test))^2)
+  fold_RMSE <- sqrt(mean((y_test - preds_test_cal)^2))
+  fold_cor  <- cor(y_test, preds_test_cal)
+  fold_MAE  <- mean(abs(y_test - preds_test_cal))
+
+  results <- rbind(results,
+                   data.frame(fold = fold_i, R2 = fold_R2,
+                              RMSE = fold_RMSE, Pearson = fold_cor,
+                              MAE = fold_MAE))
+
+  cat(sprintf("Fold %d: R2=%.3f  RMSE=%.3f  Pearson=%.3f  MAE=%.3f\n",
+              fold_i, fold_R2, fold_RMSE, fold_cor, fold_MAE))
+}
+
+print(results)
+cat("Mean OOS R2:", round(mean(results$R2, na.rm = TRUE), 5), "\n")
+cat("Mean OOS MAE:", round(mean(results$MAE, na.rm = TRUE), 5), "\n")
+cat("Mean OOS Pearson:", round(mean(results$Pearson, na.rm = TRUE), 5), "\n")
+cat("Mean OOS RMSE:", round(mean(results$RMSE, na.rm = TRUE), 5), "\n")
+
+pred_df <- data.frame(
+  fold = rep(seq_len(n_folds), times = sapply(folds_list, function(x) length(x[[2]]))),
+  true = y_complete,                   # true values
+  pred_raw = oof_preds,                # uncalibrated out-of-fold preds
+  pred_cal = oof_preds_cal,            # calibrated out-of-fold preds
+  county_id = global_row2county,       # county index (if available)
+  x = X_mat_all$x[complete.cases(X_mat_all)],
+  y = X_mat_all$y[complete.cases(X_mat_all)]
+)
+
+
+```
+
+# custom objective fn
+```{r}
+
+# Make sure X matrix matches training feature names exactly
+Xmat_full <- as.matrix(train_df %>% dplyr::select(all_of(features), x, y) %>% mutate(across(everything(), as.numeric)))
+y_full <- as.numeric(train_df$log_cafo)
+
+dtrain_full <- xgb.DMatrix(data = Xmat_full, label = y_full)
+
+# Rebuild row2county and county_rows_list for full dataset
+#row2county_full <- train_df$county_penalty_id
+#county_rows_list_full <- split(seq_along(row2county_full), row2county_full)
+#if ("0" %in% names(county_rows_list_full)) county_rows_list_full[["0"]] <- NULL
+
+row2county_full <- global_row2county
+row2state_full  <- global_row2state
+
+dtrain_full <- xgb.DMatrix(data = Xmat_complete, label = y_complete)
+
+custom_obj_full <- function(preds, dtrain) {
+  
+  labels <- getinfo(dtrain, "label")
+  n <- length(preds)
+  
+  grad <- preds - labels
+  hess <- rep(1.0, n)
+
+  # -------- COUNTY PENALTY --------
+  valid_rows_cnty <- which(row2county_full > 0)
+
+  if (length(valid_rows_cnty) > 0) {
+    cnty_pred_sums <- rowsum(preds[valid_rows_cnty],
+                             group = row2county_full[valid_rows_cnty])
+    cid <- as.integer(rownames(cnty_pred_sums))
+    old_vals_cnty <- old_by_id[cid]
+    cnty_resid <- cnty_pred_sums[,1] - old_vals_cnty
+
+    penalty_grad_cnty <- rep(0, n)
+    penalty_grad_cnty[valid_rows_cnty] <-
+      2 * lambda * cnty_resid[as.character(row2county_full[valid_rows_cnty])]
+
+    has_old_cnty <- !is.na(old_by_id[row2county_full[valid_rows_cnty]])
+    penalty_hess_cnty <- rep(0, n)
+    penalty_hess_cnty[valid_rows_cnty[has_old_cnty]] <- 2 * lambda
+
+    grad <- grad + penalty_grad_cnty
+    hess <- hess + penalty_hess_cnty
+  }
+
+  # -------- STATE PENALTY --------
+  valid_rows_state <- which(row2state_full > 0)
+
+  if (length(valid_rows_state) > 0) {
+
+    state_pred_sums <- rowsum(preds[valid_rows_state],
+                              group = row2state_full[valid_rows_state])
+    sid <- as.integer(rownames(state_pred_sums))
+    old_vals_state <- state_by_id[sid]
+
+    state_resid <- state_pred_sums[,1] - old_vals_state
+
+    penalty_grad_state <- rep(0, n)
+    penalty_grad_state[valid_rows_state] <-
+      2 * lambda_state * state_resid[as.character(row2state_full[valid_rows_state])]
+
+    has_old_state <- !is.na(state_by_id[row2state_full[valid_rows_state]])
+    penalty_hess_state <- rep(0, n)
+    penalty_hess_state[valid_rows_state[has_old_state]] <- 2 * lambda_state
+
+    grad <- grad + penalty_grad_state
+    hess <- hess + penalty_hess_state
+  }
+
+  return(list(grad = grad, hess = hess))
+}
+
+```
+
+# evaluation using correlation
+```{r}
+corr_metric <- function(preds, dtrain) {
+  labels <- getinfo(dtrain, "label")
+  # compute county-level sums for preds and labels using row2county mapping
+  # preds and labels correspond to rows in DMatrix (i.e., Xmat_complete order)
+  # For county-level metric we only consider counties with old totals
+  pred_sums <- tapply(preds, row2county, sum)
+  label_sums <- tapply(labels, row2county, sum)
+  # Both pred_sums and label_sums will have an entry for "0" if present — drop it
+  if ("0" %in% names(pred_sums)) {
+    pred_sums <- pred_sums[names(pred_sums) != "0"]
+    label_sums <- label_sums[names(label_sums) != "0"]
+  }
+  # align to same order
+  common_names <- intersect(names(pred_sums), names(label_sums))
+  ps <- as.numeric(pred_sums[common_names])
+  ls <- as.numeric(label_sums[common_names])
+  if (length(ps) <= 1 || var(ps) == 0 || var(ls) == 0) {
+    # not enough variance to compute correlation
+    return(list(metric = "county_pearson", value = 0))
+  } else {
+    corr_val <- cor(ps, ls, method = "pearson")
+    return(list(metric = "county_pearson", value = corr_val))
+  }
+}
+
+```
+
+# error metrics
+```{r}
+# RMSE
+rmse_eval <- function(preds, dtrain) {
+  labels <- getinfo(dtrain, "label")
+  rmse <- sqrt(mean((preds - labels)^2))
+  return(list(metric = "grid_RMSE", value = rmse))
+}
+
+# MAE
+mae_eval <- function(preds, dtrain) {
+  labels <- getinfo(dtrain, "label")
+  mae <- mean(abs(preds - labels))
+  return(list(metric = "grid_MAE", value = mae))
+}
+
+# R^2
+r2_eval <- function(preds, dtrain) {
+  labels <- getinfo(dtrain, "label")
+  ss_res <- sum((labels - preds)^2)
+  ss_tot <- sum((labels - mean(labels))^2)
+  r2 <- 1 - ss_res/ss_tot
+  return(list(metric = "grid_R2", value = r2))
+}
+
+
+
+```
+
+# spatial autocorrelation
+```{r}
+library(blockCV)
+autocorr <- cv_spatial_autocor(x = labeled, column = "log_cafo", plot=TRUE, progress=TRUE, num_sample = 6000)
+
+spatial_blocks <- blockCV::cv_spatial(
+  labeled_sf,
+  k = 5,
+  size = 140000,
+  hexagon = FALSE,
+  progress = FALSE)
+
+train_ids <- lapply(spatial_blocks$folds_list, function(x) x[[1]])
+test_ids <- lapply(spatial_blocks$folds_list, function(x) x[[2]])
+tr_control <- caret::trainControl(
+  method = "cv",
+  index = train_ids,
+  indexOut = test_ids,
+  savePredictions = TRUE)
+
+
+folds <- spatial_blocks$folds_list
+pred_all <- numeric(nrow(train_sf))
+true_all <- train_sf$true  # your response variable column
+r2_folds <- numeric(length(folds))
+cor_folds <- numeric(length(folds))
+
+```
+
+
+# final training
+```{r}
+# try residual learning -- look at residuals between prediction -- nonlinear fashion to learn residuals
+# low adjustment for lower numbers but under reporting for large numbers
+# examine error structure, what about splines (but control for degree of freedom)
+
+params <- list(
+  max_depth = 4,
+  eta = 0.03,
+  subsample = 0.8,
+  colsample_bytree = 0.6)
+
+
+final_bst <- xgb.train(
+  params = params,
+  data = dtrain_full,
+  nrounds = 400,
+  obj = custom_obj_full,
+  feval = corr_metric,
+  verbose = 1)
+
+
+```
+
+
+# prediction - state penalty
+```{r}
+# fit final calibration model
+preds_full_raw <- predict(final_bst, dtrain_full)
+cal_df <- data.frame(preds = preds_full_raw, y=y_complete)
+cal_model <- lm(y ~ poly(preds, 2, raw = TRUE), data = cal_df)
+preds_full_cal <- predict(cal_model, newdata = data.frame(preds = preds_full_raw))
+preds_full_cal <- pmax(0, preds_full_cal)
+labeled_df$pred_cafo <- exp(preds_full_cal) - 1
+
+preds_full_cal <- train_df %>%
+  mutate(pred_cal = exp(preds_full_cal) - 1,
+         true = cafo_count, pred = preds_full_raw)
+
+
+
+# predict on unlabeled grid cells
+X_unlabeled <- unlabeled_df %>%
+  dplyr::select(all_of(features), x, y) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+preds_raw <- predict(final_bst, X_unlabeled) 
+preds_cal <- predict(cal_model, newdata = data.frame(preds = preds_raw))
+preds_cal <- pmax(0, preds_cal)
+
+unlabeled_df$pred_cafo <- exp(preds_cal) - 1
+
+# rounding
+labeled_df$pred_cafo <- round(labeled_df$pred_cafo)
+unlabeled_df$pred_cafo <- round(unlabeled_df$pred_cafo)
+
+
+
+```
+
+# county totals
+```{r}
+county_preds <- unlabeled_df %>%
+  group_by(FIPS) %>%
+  summarise(pred_CAFOs = sum(pred_cafo, na.rm = TRUE))
+
+```
+
+# state totals
+```{r}
+state_preds <- unlabeled_df %>%
+  group_by(STATE_N) %>%
+  summarise(pred_CAFOs1 = sum(pred_cafo, na.rm = TRUE))
+# compare
+states_compare <- left_join(state_preds, state_totals, by = c("STATE_N" = "State")) %>%
+  mutate(diff = pred_CAFOs1 - Total_CAFOs, ratio = pred_CAFOs1 / Total_CAFOs)
+states_compare$ratio <- round(states_compare$ratio, 4)
+print(states_compare[, c("STATE_N", "pred_CAFOs1", "Total_CAFOs", "diff", "ratio")])
+
+```
+
+# correlation, R2 before and after
+```{r}
+cor_before <- cor(preds_full_cal$true, preds_full_cal$pred)
+r2_before <- 1 - sum((preds_full_cal$true - preds_full_cal$pred)^2) / sum((preds_full_cal$true - mean(preds_full_cal$true))^2)
+
+# after
+cor_after <- cor(preds_full_cal$true, preds_full_cal$pred_cal)
+r2_after <- 1 - sum((preds_full_cal$true - preds_full_cal$pred_cal)^2) / sum((preds_full_cal$true - mean(preds_full_cal$true))^2)
+data.frame(metric = c("pearson", "R2"), before = c(cor_before, r2_before), after = c(cor_after, r2_after))
+
+
+```
+
+# prediction
+```{r}
+
+# labeled prediction
+preds_train <- predict(final_bst, xgb.DMatrix(Xmat_full))
+preds_train_cal <- predict(fit_cal, newdata = data.frame(oof_preds = preds_train))
+
+preds_train_cal <- train_df[complete.cases(X_mat), ] %>%
+  mutate(pred = exp(preds_train_cal) - 1,
+         true = cafo_count)
+labeled_df$pred_cafo <- preds_train_cal$pred
+
+# nonlienar recal
+preds_train_gam_cal <- predict(gam_cal, newdata = data.frame(oof = preds_train))
+preds_train_gam_cal <- train_df[complete.cases(X_mat), ] %>%
+  mutate(pred_cal = exp(preds_train_gam_cal) - 1,
+         true = cafo_count, pred = preds_train)
+labeled_df$pred_cafo <- preds_train_gam_cal$pred
+
+# poly recal
+preds_train_poly_cal <- predict(poly_cal, newdata = data.frame(oof = preds_train))
+preds_train_poly_cal <- train_df %>%
+  mutate(pred_cal = exp(preds_train_poly_cal) - 1,
+         true = cafo_count, pred = preds_train)
+labeled_df$pred_cafo <- preds_train_poly_cal$pred_cal
+
+# global recal
+preds_train <- predict(final_bst, xgb.DMatrix(Xmat_full))
+preds_train_cal <- predict(global_cal, newdata = data.frame(pred = preds_train))
+preds_train_cal <- train_df %>%
+  mutate(pred_cal = exp(preds_train_cal) - 1,
+         true = cafo_count, pred = preds_train)
+labeled_df$pred_cafo <- preds_train_cal$pred_cal
+
+# unlabeled prediction
+X_test <- unlabeled_df %>%
+  dplyr::select(all_of(features), x, y) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+dtest <- xgb.DMatrix(data = X_test)
+preds <- predict(final_bst, dtest) 
+
+preds_cal <- predict(poly_cal, newdata = data.frame(oof = preds))
+preds_cal <- exp(preds_cal) - 1
+
+unlabeled_df$pred_cafo <- preds_cal
+
+
+# round
+labeled_df$pred_cafo <- round(labeled_df$pred_cafo)
+labeled_df <- labeled_df %>% mutate(pred_cafo = ifelse(pred_cafo < 0, 0, pred_cafo))
+unlabeled_df$pred_cafo <- round(unlabeled_df$pred_cafo)
+unlabeled_df <- unlabeled_df %>% mutate(pred_cafo = ifelse(pred_cafo < 0, 0, pred_cafo))
+
+cor_before <- cor(preds_train_poly_cal$true, preds_train_poly_cal$pred)
+r2_before <- 1 - sum((preds_train_poly_cal$true - preds_train_poly_cal$pred)^2) / sum((preds_train_poly_cal$true - mean(preds_train_poly_cal$true))^2)
+
+# after
+cor_after <- cor(preds_train_poly_cal$true, preds_train_poly_cal$pred_cal)
+r2_after <- 1 - sum((preds_train_poly_cal$true - preds_train_poly_cal$pred_cal)^2) / sum((preds_train_poly_cal$true - mean(preds_train_poly_cal$true))^2)
+data.frame(metric = c("pearson", "R2"), before = c(cor_before, r2_before), after = c(cor_after, r2_after))
+
+
+
+
+#-------------------
+
+# post training calibration to improve R2
+fit_cal <- lm(true ~ pred, data = preds_train)
+summary(fit_cal)
+coef(fit_cal)
+
+# adjust predictions
+preds_train$pred_cal <- predict(fit_cal, newdata = preds_train)
+with(preds_train, cor(pred_cal, true, method = "pearson", use = "complete.obs"))
+with(preds_train, 1 - sum((true - pred_cal)^2) / sum((true - mean(true))^2))
+
+# metrics
+cor_before <- cor(preds_train$true, preds_train$pred)
+r2_before <- 1 - sum((preds_train$true - preds_train$pred)^2) / sum((preds_train$true - mean(preds_train$true))^2)
+
+# after
+cor_after <- cor(preds_train$true, preds_train$pred_cal)
+r2_after <- 1 - sum((preds_train$true - preds_train$pred_cal)^2) / sum((preds_train$true - mean(preds_train$true))^2)
+
+data.frame(metric = c("pearson", "R2"), before = c(cor_before, r2_before), after = c(cor_after, r2_after))
+
+# round
+preds_train$pred_cal <- round(preds_train$pred_cal)
+preds_train <- preds_train %>% mutate(pred_cal = ifelse(pred_cal < 0, 0, pred_cal))
+labeled_df$pred_cal <- preds_train$pred_cal
+
+# unlabeled data
+unlabeled_df$pred_cafo_count_1 <- predict(bst, xgb.DMatrix(as.matrix(unlabeled_df %>% dplyr::select(all_of(features), x, y))))
+unlabeled_df$pred_cal <- predict(fit_cal, newdata = unlabeled_df %>% dplyr::select(pred = pred_cafo_count_1))
+unlabeled_df$pred_cal <- round(unlabeled_df$pred_cal)
+unlabeled_df <- unlabeled_df %>% mutate(pred_cal = ifelse(pred_cal < 0, 0, pred_cal))
+
+
+
+```
+
+# errors by bucket
+```{r, fig.align="center", echo = FALSE, fig.width = 15}
+#cor(preds_train_poly_cal$pred_cal, preds_train_poly_cal$true, method = "pearson", use = "complete.obs") # ranking correlation
+cor(preds_full_cal$pred_cal, preds_full_cal$true, method = "pearson")
+
+# error by buckets
+preds_full_cal <- preds_full_cal %>%
+  mutate(bucket = case_when(
+      true == 0 ~ "0",
+      true < 10 ~ "<10",
+      true >= 10 ~ ">=10"),
+    abs_error = abs(pred_cal - true),
+    rel_error = ifelse(true > 0, abs(pred_cal - true) / true, NA_real_),
+    corr = cor(pred_cal, true, method = "pearson", use = "complete.obs"))
+
+error_summary <- preds_full_cal %>%
+  group_by(bucket) %>%
+  summarise(
+    mean_abs_error = mean(abs_error, na.rm = TRUE),
+    median_abs_error = median(abs_error, na.rm = TRUE),
+    mean_rel_error = mean(rel_error, na.rm = TRUE),
+    median_rel_error = median(rel_error, na.rm=TRUE),
+    pct_within_5 = mean(abs_error <= 0.05 * (true + 1e-6)),
+    pct_within_10 = mean(abs_error <= 0.10 * (true + 1e-6)),
+    RMSE = sqrt(mean((pred_cal - true)^2, na.rm = TRUE)),
+    R2 = 1 - sum((pred_cal - true)^2, na.rm = TRUE) / sum((true - mean(true))^2, na.rm = TRUE),
+    n = n())
+print(error_summary)
+
+mae_0 <- preds_full_cal %>%
+  filter(bucket == "0") %>%
+  summarise(MAE = mean(abs_error)) %>%
+  pull(MAE)
+
+mae_under_10 <- preds_full_cal %>%
+  filter(bucket == "<10") %>%
+  summarise(MAE = mean(abs_error)) %>%
+  pull(MAE)
+
+mae_over_10 <- preds_full_cal %>%
+  filter(bucket == ">=10") %>%
+  summarise(MAE = mean(abs_error)) %>%
+  pull(MAE)
+
+rel_mae_0 <- preds_full_cal %>%
+  filter(bucket == "0") %>%
+  summarise(Rel_MAE = mean(rel_error)) %>%
+  pull(Rel_MAE)
+
+rel_mae_under_10 <- preds_full_cal %>%
+  filter(bucket == "<10") %>%
+  summarise(Rel_MAE = mean(rel_error)) %>%
+  pull(Rel_MAE)
+
+rel_mae_over_10 <- preds_full_cal %>%
+  filter(bucket == ">=10") %>%
+  summarise(Rel_MAE = mean(rel_error)) %>%
+  pull(Rel_MAE)
+
+corr_0 <- preds_full_cal %>%
+  filter(bucket == "0") %>%
+  summarise(Pearson = cor(pred, true, use = "complete.obs")) %>%
+  pull(Pearson)
+
+corr_under_10 <- preds_full_cal %>%
+  filter(bucket == "<10") %>%
+  summarise(Pearson = cor(pred, true, use = "complete.obs")) %>%
+  pull(Pearson)
+
+corr_over_10 <- preds_full_cal %>%
+  filter(bucket == ">=10") %>%
+  summarise(Pearson = cor(pred, true, use = "complete.obs")) %>%
+  pull(Pearson)
+
+
+
+paste0("MAE [0]: ", round(mae_0, 3))
+paste0("MAE (0,10]: ", round(mae_under_10, 3))
+paste0("MAE (10, inf): ", round(mae_over_10, 3))
+paste0("Relative MAE (0, 10): ", round(rel_mae_under_10, 3))
+paste0("Relative MAE (10, inf): ", round(rel_mae_over_10, 3))
+paste0("Correlation [0]: ", round(corr_0, 3))
+paste0("Correlation (0,10]: ", round(corr_under_10, 3))
+paste0("Correlation (10, inf): ", round(corr_over_10, 3))
+
+library(gridExtra)
+g1 <- ggplot(error_summary, aes(bucket, mean_abs_error, fill = bucket)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = round(mean_abs_error, 2)), vjust = -0.5, size = 3) +
+  theme_minimal() +
+  labs(title = "Mean Absolute Error by CAFO Count Bucket",
+       x = "CAFO Count Category", y = "MAE")
+
+g2 <- ggplot(error_summary, aes(bucket, median_abs_error, fill = bucket)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = round(median_abs_error, 2)), vjust = -0.5, size = 3) +
+  theme_minimal() +
+  labs(title = "Median Absolute Error by CAFO Count Bucket",
+       x = "CAFO Count Category", y = "Median Absolute Error")
+
+g3 <- ggplot(error_summary, aes(bucket, mean_rel_error, fill = bucket)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = round(mean_rel_error, 2)), vjust = -0.5, size = 3) +
+  theme_minimal() +
+  labs(title = "Mean Relative Error by CAFO Count Bucket",
+       x = "CAFO Count Category", y = "Mean Relative Error")
+
+g4 <- ggplot(error_summary, aes(bucket, median_rel_error, fill = bucket)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = round(median_rel_error, 2)), vjust = -0.5, size = 3) +
+  theme_minimal() +
+  labs(title = "Median Relative Error by CAFO Count Bucket",
+       x = "CAFO Count Category", y = "Median Relative Error")
+
+grid.arrange(g1, g2, g3, g4)
+# see if errors are clustered in specific areas (find way to justify that model is good evenwith high relative error -- west)
+
+```
+
+# Are errors clustered in specific region?
+```{r}
+pred_df <- pred_df %>% mutate(abs_error = abs(pred_cal - true))
+pred_sf <- st_as_sf(pred_df, coords = c("x", "y"), crs = 5070)
+
+
+ggplot(pred_sf) +
+  geom_sf(aes(color = abs_error)) +
+    scale_color_gradient2(
+    low = "blue", mid = "white", high = "red") +
+  theme_minimal()
+
+ggplot(pred_sf) +
+  geom_sf(aes(color = residual), size = 0.5, alpha = 1) +
+  scale_color_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0
+  ) +
+  theme_minimal() + labs(
+    title = "Eror Map of log1p(CAFO count)")
+
+
+ggplot(pred_sf, aes(x = true, y = abs_error)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth() +
+  labs(
+    x = "Observed CAFO Count",
+    y = "Absolute Error",
+    title = "CAFO Count and Error"
+  ) +
+  theme_minimal()
+
+
+# moran's I
+library(spdep)
+# Convert  to spatial points
+pred_coords <- st_coordinates(pred_sf)
+
+# Create k-nearest neighbors spatial weight matrices (e.g., k=4)
+pred_knn <- knearneigh(pred_coords, k = 4)
+pred_nb <- knn2nb(pred_knn)
+pred_weights <- nb2listw(pred_nb, style = "W")
+
+# Compute Moran's I 
+moran <- moran.test(pred_sf$residual, pred_weights)
+
+print(moran)
+
+# local moran map - LISA cluster
+local_moran <- localmoran(pred_sf$residual, pred_weights)
+pred_sf$Ii <- local_moran[, "Ii"]
+pred_sf$Z_Ii <- local_moran[, "Z.Ii"]
+
+ggplot(pred_sf) +
+  geom_sf(aes(color = Z_Ii), size = 0.5) +
+  scale_color_gradient2(low="blue", mid="white", high="red") +
+  labs(title="Local Moran’s I (Residual Clustering)") +
+  theme_minimal()
+
+
+```
+
+
+# MAE plot
+```{r}
+ggplot(error_summary, aes(x = factor(bucket))) +
+  geom_col(aes(y = mean_rel_error), fill = "lightblue") +
+  geom_point(aes(y = median_rel_error), color = "navy", size = 3) +
+  labs(
+    title = "Relative Error Across Buckets of True Count",
+    x = "Buckets",
+    y = "Relative Error"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+
+# Plots
+## Combined
+```{r}
+unlabeled$cafo_count <- unlabeled_df$pred_cafo
+
+combined_sf <- rbind(
+  unlabeled[, c("geometry", "cafo_count")],
+  labeled[, c("geometry", "cafo_count")]
+)
+have_cafos <- unique(combined_cafos$state_name)
+not_cafo_states <- us_counties_contiguous %>%
+  filter(!(STATE_NAME %in% have_cafos))
+not_cafo_states |> 
+  st_union() -> notcafo
+
+summary(combined_sf$cafo_count)
+quantile(combined_sf$cafo_count, probs = seq(0, 1, 0.1))
+combined_sf$cafo_count <- as.numeric(combined_sf$cafo_count)
+full_cafo_map <- st_join(us_grid, combined_sf, left = TRUE)
+full_cafo_map$`cafo_count.y`[is.na(full_cafo_map$`cafo_count.y`)] <- 0
+library(rmapshaper)
+full_cafo_map <- rmapshaper::ms_simplify(full_cafo_map, keep = 0.05)
+
+ggplot(combined_sf) +
+  geom_sf(aes(fill = log1p(cafo_count)), color = NA) +
+  geom_sf(data = notcafo, color="red", fill = NA, linewidth = 0.5) +
+  scale_fill_viridis_c(option = "plasma", name = "log1p(CAFO count)") +
+  labs(title = "Observed + Predicted CAFO Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot() +
+  geom_sf(data = combined_sf, aes(fill = log1p(cafo_count)), alpha = 0.9, color = NA) +
+  geom_sf(data = notcafo, color="red", fill = NA, linewidth = 0.5) +
+  scale_fill_viridis_c(option = "plasma", name = "log1p(CAFO count)") +
+  labs(title = "Observed + Predicted CAFO Density") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+
+```
+
+## Combined Predicted
+```{r}
+labeled$pred_cafo <- labeled_df$pred_cafo
+unlabeled$pred_cafo <- unlabeled_df$pred_cafo
+combined_sf2 <- rbind(
+  unlabeled[, c("geometry", "pred_cafo")],
+  labeled[, c("geometry", "pred_cafo")])
+combined_sf2 <- st_as_sf(combined_sf2, coords = c("y", "x"), crs = st_crs(us_grid))
+
+combined_sf2 <- st_join(us_grid, combined_sf2, left = TRUE) 
+combined_sf2$pred_cafo[is.na(combined_sf2$pred_cafo)] <- 0
+
+combined_sf2 <- combined_sf2 %>%
+  st_centroid() %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  bind_cols(combined_sf2 %>% st_drop_geometry())
+
+names(combined_sf2)[1:2] <- c("x", "y")
+
+plot_sample <- combined_sf2 %>%
+  sample_frac(0.35)  #took sample of 30% of cells for memory
+
+ggplot() +
+  geom_sf(data = plot_sample, aes(fill = log1p(pred_cafo)), color = NA) +
+  geom_sf(data = notcafo, linewidth = 0.5, color = "red", fill = NA) +
+  scale_fill_viridis_c(option="plasma") +
+  labs(title = "Predicted CAFO Count (log1p)",
+       fill = "log1p(CAFO Count)") + 
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+```
+
+
+# pos/neg downsampling graph
+```{r}
+neg_samples <- labeled_df %>% filter(labeled_df$cafo_count == 0)
+pos_samples <- labeled_df %>% filter(cafo_count > 0)
+
+ggplot(labeled_df, aes(x, y)) +
+  geom_point(data = pos_samples, aes(color = "Positive"), alpha = 0.5, size = 0.5) +
+  geom_point(data = neg_samples, aes(color = "Negative"), alpha = 0.5, size = 0.5) +
+  scale_color_manual(values = c("Positive" = "red", "Negative" = "blue")) +
+  coord_equal() +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) + 
+  labs(title = "Sampling Scheme - Training Data", color = "Sample Type", family = "Helvetica") + 
+  theme(plot.title = element_text(hjust = 0.5, family = "Helvetica"))
+
+
+```
+
+# fold metrics
+```{r}
+results_long <- results %>%
+  pivot_longer(cols = c(R2, RMSE, MAE, Pearson),
+               names_to = "metric", values_to = "value")
+
+ggplot(results_long, aes(x = metric, y = value, fill = metric)) +
+  geom_boxplot(alpha = 0.6) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "Model Performance Across Spatial Folds",
+       y = "Value", x = NULL)
+
+
+```
+
+# calibrated vs uncalibrated prediction
+```{r}
+ggplot(pred_df, aes(true, pred_raw)) +
+  geom_point(alpha = 0.4, color = "red", alpha = 0.4) +
+  geom_point(aes(y = pred_cal), color = "blue", alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "grey", linetype = "dashed") +
+  coord_equal() +
+  theme_minimal() +
+  labs(title = "Predicted vs Observed (Raw vs Calibrated)",
+       x = "Observed CAFO Count",
+       y = "Predicted CAFO Count")
+
+# red = raw vs observed
+# blue = calibrated vs observed
+# gray = perfect prediction line -- good calibration means points should cluster
+# do in log scale
+
+```
+
+# residual structure
+```{r}
+pred_df <- pred_df %>%
+  mutate(pred_cal_exp = exp(pred_cal) - 1, true_exp = exp(true) - 1, pred_raw_exp = exp(pred_raw) - 1) 
+pred_df <- pred_df %>%
+  mutate(residual_exp = pred_cal_exp - true_exp, residual = pred_cal - true) 
+
+ggplot(pred_df, aes(true, residual)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", color = "red") +
+  theme_minimal() +
+  labs(title = "Residuals vs True CAFO Counts",
+       y = "Residual (Predicted - Observed)",
+       x = "Observed CAFO Count")
+
+
+```
+
+# error map
+```{r}
+error_df <- data.frame(
+  x = labeled_df$x,
+  y = labeled_df$y,
+  true = y_complete,
+  pred = oof_preds_cal
+) %>%
+  mutate(
+    abs_error = abs(pred - true),
+    rel_error = ifelse(true > 0, abs_error / true, NA_real_)
+  )
+error_df_binned <- error_df %>%
+  mutate(
+    x_bin = round(x / 10000) * 10000, 
+    y_bin = round(y / 10000) * 10000
+  ) %>%
+  group_by(x_bin, y_bin) %>%
+  summarise(mean_abs_error = mean(abs_error, na.rm = TRUE))
+
+
+ggplot(error_df_binned, aes(x_bin, y_bin, fill = mean_abs_error)) +
+  geom_tile() +
+  coord_equal() + theme_minimal() + 
+  scale_fill_viridis_c(name = "Mean Absolute Error (binned)", option = "plasma") +
+  labs(title = "Spatially Aggregated Prediction Error")
+
+
+```
+
+# errors
+```{r}
+ggplot(pred_sf, aes(x = true, y = abs(pred_cal - true))) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "loess", color = "red") +
+  scale_y_continuous("Absolute Error") +
+  scale_x_continuous("Observed CAFO Count") +
+  theme_minimal() +
+  labs(title = "Aboslute Error")
+## errors decrease with CAFO count
+
+
+```
+# error by region
+```{r}
+region_lookup <- data.frame(
+  state_name = c(
+    # Northeast
+    "Maine","New Hampshire","Vermont","Massachusetts","Rhode Island",
+    "Connecticut","New York","New Jersey","Pennsylvania",
+    # Midwest
+    "Ohio","Indiana","Illinois","Michigan","Wisconsin","Minnesota",
+    "Iowa","Missouri","North Dakota","South Dakota","Nebraska","Kansas",
+    # South
+    "Delaware","Maryland","District of Columbia","Virginia","West Virginia",
+    "North Carolina","South Carolina","Georgia","Florida","Kentucky",
+    "Tennessee","Mississippi","Alabama","Oklahoma","Texas","Arkansas","Louisiana",
+    # West
+    "Idaho","Montana","Wyoming","Nevada","Utah","Colorado","Arizona","New Mexico","Washington","Oregon","California"),
+  region = c(
+    rep("Northeast", 9),
+    rep("Midwest", 12),
+    rep("South", 17),
+    rep("West", 11)
+  )
+)
+
+labeled <- labeled %>% left_join(region_lookup, by = c("STATE_N" = "state_name"))
+labeled$pred_cal <- pred_df$pred_cal
+labeled <- labeled %>%
+  mutate(bucket = case_when(
+      cafo_count == 0 ~ "0",
+      cafo_count < 10 ~ "<10",
+      cafo_count >= 10 ~ ">=10"))
+
+
+mae_by_region <- labeled %>%
+    mutate(
+    abs_error = abs(pred_cal - log_cafo),
+    rel_error = ifelse(log_cafo > 0, abs(pred_cal - log_cafo) / log_cafo, NA_real_)) %>%
+  group_by(region, bucket) %>%
+  summarize(
+    n = n(),
+    MAE = mean(abs_error, na.rm = TRUE),
+    rel_MAE = mean(rel_error, na.rm=TRUE),
+    median_abs_error = median(abs_error, na.rm = TRUE),
+    rel_median_abs_error = median(rel_error, na.rm = TRUE),
+    RMSE = sqrt(mean((pred_cal - log_cafo)^2, na.rm = TRUE)),
+    R2 = 1 - sum((log_cafo - pred_cal)^2, na.rm=TRUE) / sum((log_cafo - mean(log_cafo, na.rm=TRUE))^2),
+    Pearson = cor(log_cafo, pred_cal, use = "complete.obs"))
+mae_by_region
+
+ggplot(mae_by_region, aes(region, MAE, fill=region)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title="MAE by U.S. Census Region", y="Mean Absolute Error")
+
+# R2 and correlation, break down relative errors in bins
+# try to aggregate predictions to county level to average out noise from grid level
+# try to use state level cafo counts - state to county to grid b/c of noise in grid level
+# plot error distribution for each bucket
+
+```
+
+
+# train normally
+```{r}
+library(xgboost)
+str(us_grid %>% dplyr::select(all_of(features), x, y))
+
+# training matrices
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(labeled_df %>% dplyr::select(all_of(features), x, y)),
+  label = labeled_df$cafo_count,
+  weight = labeled_df$weight)
+
+# parameter grid
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  max_depth = 4,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.7)
+
+# train model
+xgb_base <- xgb.train(
+  params = params,
+  data = train_matrix,
+  nrounds = 300)
+
+# prediction
+us_grid_df <- us_grid %>%
+  st_drop_geometry() %>%
+  dplyr::select(all_of(features), x, y) %>%
+  dplyr::mutate(across(everything(), as.numeric))
+preds <- predict(xgb_base, as.matrix(us_grid_df))
+us_grid$pred_cafo <- preds
+
+us_grid$pred_cafo <- predict(xgb_base, as.matrix(us_grid_df %>% dplyr::select(all_of(features), x, y)))
+
+
+```
+
+# county-level penalty
+```{r}
+county_preds <- us_grid %>%
+  group_by(FIPS) %>%
+  summarise(pred_total = sum(pred_cafo, na.rm = TRUE),
+            old_total = first(number)) %>%
+  filter(!is.na(old_total))
+
+# compute penalty term: how far off from old county totals
+county_preds <- county_preds %>%
+  mutate(penalty = abs(pred_total - old_total) / (old_total + 1))
+mean_penalty <- mean(county_preds$penalty)
+print(mean_penalty)
+
+```
+
+# incorporate penalty in training
+```{r}
+# custom loss fn with county level penalty included
+county_penalty_loss <- function(preds, dtrain) {
+  labels <- getinfo(dtrain, "label")
+  
+  # base squared error gradient/hessian
+  grad <- preds - labels
+  hess <- rep(1, length(labels))
+  
+  # county level penalty
+  train_data <- getinfo(dtrain, "data")  # design matrix
+  county_penalty <- mean(preds) - mean(labels)
+  grad <- grad + 0.01 * county_penalty # soft penalty --> weight = 0.01
+  
+  list(grad = grad, hess = hess)
+}
+
+# retrain now with custom loss
+xgb_penalized <- xgb.train(
+  params = list(max_depth=4, eta=0.05, subsample=0.8, colsample_bytree=0.7),
+  data = train_matrix,
+  nrounds = 300,
+  obj = county_penalty_loss)
+
+# include epa data as covariate in model --> if they match generally, then epa can be considered credible
+# look at correlation rather than absolute difference (remove scaling)
+
+
+
+epa_corr <- cor(county_compare$pred_total, county_compare$epa_count, use = "complete.obs")
+
+```
+
+
+
+# extras
+```{r}
+#fit_cal <- lm(y_train ~ preds_train_fold)
+  #df_cal <- data.frame(preds_train_fold = preds_train_fold, y = y_train)
+  #df_cal$w <- sqrt(df_cal$y + 1)     
+  #fit_cal <- gam(y ~ s(preds_train_fold, k = 10), data = df_cal, weights = df_cal$w)
+
+
+
+watchlist <- list(train = dtrain)
+set.seed(123)
+bst <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 300,
+  obj = custom_obj,
+  feval = corr_metric,
+  maximize = TRUE,   # because custom_metric is correlation (higher=better)
+  verbose = 1,
+  watchlist = watchlist
+)
+
+mean(bst$evaluation_log$train_county_pearson)
+
+```

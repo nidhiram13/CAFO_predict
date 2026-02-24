@@ -1,0 +1,160 @@
+---
+title: "Downscaling Employment"
+author: "Nidhi Ram"
+date: "2025-07-02"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(tidyverse)
+library(sf) 
+library(ggplot2) 
+library(leaflet) 
+library(dplyr) 
+library(tigris) 
+library(tidyr)
+library(gt)
+library(zipcodeR)
+library(maps)
+library(tidycensus)
+library(terra)
+library(exactextractr)
+library(raster)
+library(eeptools)
+library(gstat)
+library(classInt)
+```
+
+# Population Weighted IDW
+
+## Centers of Population
+```{r}
+centers <- read.csv("https://www2.census.gov/geo/docs/reference/cenpop2020/county/CenPop2020_Mean_CO.txt")
+centers <- st_as_sf(centers, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+centers <- st_transform(centers, 5070)
+
+centers$COUNTYFP  <- sprintf("%03s", centers$COUNTYFP)
+centers$STATEFP <- sprintf("%02s", centers$STATEFP)
+
+centers <- centers %>% 
+  mutate(FIPS = paste0(STATEFP, COUNTYFP))
+
+ag_wide$FIPS = ag_wide$GEOID
+centers <- centers %>%
+  left_join(ag_wide, by = "FIPS")
+
+# restrict to minnesota
+mn_centers <- centers %>% filter(STATEFP == 27)
+
+```
+
+## Make CONUS Grid
+```{r}
+minnesota_counties |> 
+  st_union() -> MN
+
+mn_grid <- MN  |> 
+  st_bbox() |>  
+  st_make_grid(cellsize = 10000)  
+
+ggplot() +
+  geom_sf(data = MN, fill = "white", color = "black") +
+  geom_sf(data = mn_centers) +
+  geom_sf(data = mn_grid, fill = NA) 
+
+```
+## IDW
+```{r}
+mn_centers$ag_employment[is.na(mn_centers$ag_employment)] <- 0
+
+idw(formula = ag_employment ~ 1, locations = mn_centers, newdata = mn_grid, idp = 2.0) -> pop_mn_idw_output
+summary(pop_mn_idw_output$var1.pred)
+hist(pop_mn_idw_output$var1.pred)
+
+nbreaks <- classIntervals(pop_mn_idw_output$var1.pred, n = 5, style = "fisher")$brks
+
+pop_mn_idw_output |> 
+  st_intersection(MN) -> pop_mn_idw_clip
+
+
+ggplot() +
+  geom_sf(data = MN, fill = "white", color = "black") +
+  geom_sf(data = pop_mn_idw_clip, aes(fill = var1.pred), color = NA, alpha = .9) +
+  scale_fill_fermenter(direction = 1, palette = "YlOrRd", breaks = nbreaks)
+
+```
+
+# Other Population Data
+```{r}
+pop_data2 <- rast("~/Downloads/usa_pd_2020_1km_UNadj.tif")
+minnesota_grid$population <- exact_extract(pop_data2, minnesota_grid, "sum")
+  
+```
+
+# Areal Interpolation
+```{r}
+library(sf)
+library(dplyr)
+library(exactextractr)
+
+# intersect grid with county and compute overlapping area
+mn_grid_joined <- st_intersection(minnesota_grid, minnesota_counties)
+mn_grid_joined$area_overlap <- st_area(mn_grid_joined)
+# find total county area and join
+mn_county_area <- st_area(minnesota_counties)
+minnesota_counties$county_area <- as.numeric(mn_county_area)
+mn_grid_joined <- mn_grid_joined %>%
+  left_join(st_drop_geometry(minnesota_counties[, c("FIPS", "county_area", "ag_employment")]), by = "FIPS")
+
+# areal allocation
+mn_grid_joined$ag_employment_est <- as.numeric(mn_grid_joined$ag_employment) *
+  as.numeric(mn_grid_joined$area_overlap) / mn_grid_joined$county_area
+
+
+ggplot(mn_grid_joined) +
+  geom_sf(aes(fill = ag_employment_est)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "Areal-Allocated Agricultural Employment (MN)",
+       fill = "Employment per Grid Cell")
+
+ggplot(minnesota_counties) +
+  geom_sf(aes(fill = ag_employment)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "Areal-Allocated Agricultural Employment (MN)",
+       fill = "Employment per Grid Cell")
+
+
+```
+
+
+
+# Census Tracts - Paper
+```{r}
+v21 <- load_variables(2021, "acs5", cache = TRUE)
+
+mn_tracts <- get_acs(geography = "tract", state = "MN",
+  variables = c(
+    male_18_24 = "B01001_007", 
+    female_18_24 = "B01001_031",
+    total_pop = "B01003_001"),
+  year = 2021,
+  survey = "acs5",
+  geometry = TRUE
+)
+
+
+
+```
+
+
+# IDM
+```{r}
+
+
+```
+
+
